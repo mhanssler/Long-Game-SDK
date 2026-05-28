@@ -1,10 +1,16 @@
 [project]
 name = "long-game-sdk"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.13"
+description = "Hardware-agnostic test automation SDK"
 dependencies = [
     "pyvisa>=1.16.2",
     "pyvisa-py>=0.8.1",
+    "pyyaml>=6.0.0",
 ]
+
+[project.scripts]
+lg-check = "long_game_sdk.sdk.diagnostic:check_environment"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

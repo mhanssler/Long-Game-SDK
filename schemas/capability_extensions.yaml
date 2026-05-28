@@ -1,0 +1,36 @@
+# Schema extension for complex instrumentation capabilities
+
+capabilities:
+  # Oscilloscope definition
+  oscilloscope:
+    commands:
+      set_vertical_scale: ":CHANnel{channel}:SCALe {value}"
+      set_timebase: ":TIMebase:MAIN:SCALe {value}"
+      capture_screenshot: ":DISPlay:DATA? PNG"
+      get_measurement: ":MEASure:ITEM? {type},CHAN{channel}"
+    parameters:
+      measurement_types: ["VPP", "VMAX", "VMIN", "VAVG", "FREQ"]
+
+  # Digital Multimeter
+  dmm:
+    commands:
+      set_function: ":FUNCtion {func}"
+      read: ":READ?"
+    parameters:
+      functions: ["VOLT:DC", "VOLT:AC", "CURR:DC", "RES", "FREQ"]
+
+  # Electronic Load
+  electronic_load:
+    commands:
+      set_mode: ":FUNCtion {mode}"
+      set_current: ":CURRent:STATic {value}"
+      turn_on: ":INPut ON"
+      turn_off: ":INPut OFF"
+    parameters:
+      modes: ["CURR", "VOLT", "RES", "POW"]
+
+  # Data Acquisition System (DAQ)
+  daq:
+    commands:
+      read_channel: ":MEASure:VOLTage:DC? (@{channel})"
+      configure_channel: ":CONFigure:VOLTage:DC {range},{res},(@{channel})"

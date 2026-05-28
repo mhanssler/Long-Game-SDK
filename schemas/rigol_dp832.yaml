@@ -1,0 +1,36 @@
+# Long Game SDK - Device Schema Definition (YAML)
+# This schema defines how an instrument maps its specific SCPI/VISA commands 
+# to the generic capabilities defined by the SDK.
+
+# 1. Device Metadata
+device:
+  manufacturer: "Rigol"
+  model: "DP832"
+  protocol: "SCPI" # Could be SCPI, Modbus, etc.
+  version: "1.0.0"
+
+# 2. Capability Mapping
+# These maps connect generic SDK methods to instrument-specific commands.
+capabilities:
+  power_supply:
+    channels: [1, 2, 3]
+    commands:
+      set_voltage: ":SOURce{channel}:VOLTage:LEVel:IMMediate:AMPLitude {value:.6f}"
+      set_current: ":SOURce{channel}:CURRent:LEVel:IMMediate:AMPLitude {value:.6f}"
+      get_voltage: ":MEASure:VOLTage? CH{channel}"
+      get_current: ":MEASure:CURRent? CH{channel}"
+      turn_on: ":OUTPut CH{channel},ON"
+      turn_off: ":OUTPut CH{channel},OFF"
+
+# 3. Constraint Definitions
+# Used for runtime validation (e.g., set_voltage limits)
+constraints:
+  channel_limits:
+    1: {voltage: [0.0, 30.0], current: [0.0, 3.0]}
+    2: {voltage: [0.0, 30.0], current: [0.0, 3.0]}
+    3: {voltage: [0.0, 5.0], current: [0.0, 3.0]}
+
+# 4. Identification Pattern
+# How the SDK identifies this specific device when scanning the VISA bus
+identification:
+  idn_pattern: "RIGOL.*DP832.*"
