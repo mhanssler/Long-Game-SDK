@@ -17,8 +17,11 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
 1. **Install dependencies:**
    ```bash
-   # Run the installation script to get uv and set up the virtual environment
+   # On Linux/macOS:
    bash scripts/install_sdk.sh
+
+   # On Windows (PowerShell):
+   .\scripts\install_sdk.ps1
    ```
 
 2. **Verify Environment:**
