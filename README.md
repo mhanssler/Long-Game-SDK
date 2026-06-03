@@ -13,14 +13,23 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 - `src/long_game_sdk/sdk/observers/`: Background observers for hardware bus monitoring.
 - `examples/`: Reference implementations and power rail validation scripts.
 
-## Getting Started
+## Quick Start
+
 1. **Install dependencies:**
    ```bash
-   uv sync
+   # Run the installation script to get uv and set up the virtual environment
+   bash scripts/install_sdk.sh
    ```
-2. **Run the bus observer:**
+
+2. **Verify Environment:**
+   Before running tests, verify your VISA/Instrument drivers:
    ```bash
-   python src/long_game_sdk/sdk/observers/bus_observer.py
+   uv run lg-check
+   ```
+
+3. **Run the bus observer:**
+   ```bash
+   uv run python src/long_game_sdk/sdk/observers/auto_onboarder.py
    ```
 
 ## Development
