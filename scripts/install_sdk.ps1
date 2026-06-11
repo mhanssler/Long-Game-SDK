@@ -58,3 +58,4 @@ Write-Host "--- Installation complete! ---" -ForegroundColor Green
 Write-Host "Run 'uv run lg-discover' to inventory equipment." -ForegroundColor White
 Write-Host "Run 'uv run lg-onboard' to ensure schemas/drivers exist." -ForegroundColor White
 Write-Host "Run 'uv run lg-safe' before and after live hardware tests." -ForegroundColor White
+Write-Host "Run 'uv run lg-enrich' to search manuals and enrich generated schemas." -ForegroundColor White

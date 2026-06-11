@@ -26,11 +26,16 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
    The installer is intentionally interactive when OS-level USB permissions are required, so users should not have to copy/paste separate LabJack or udev commands.
 
-2. **Verify Environment:**
+2. **Verify / onboard / enrich:**
    Before running tests, verify your VISA/Instrument drivers:
    ```bash
    uv run lg-check
+   uv run lg-discover
+   uv run lg-onboard
+   uv run lg-enrich
    ```
+
+   `lg-enrich` identifies discovered VISA/SCPI hardware, searches for likely programming/user manuals, caches the manual under `manuals/`, extracts SCPI-like commands, and merges them into the YAML schema without adding unsafe output-enabling behavior.
 
 3. **Run the bus observer:**
    ```bash
