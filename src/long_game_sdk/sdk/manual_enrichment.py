@@ -363,7 +363,9 @@ def main(argv: list[str] | None = None) -> int:
         _print_result(result)
     if not results:
         print("No VISA/SCPI instruments discovered for manual enrichment.")
-    return 0 if all(not result.errors or result.commands_total > 0 for result in results) else 1
+    # Manual lookup is best-effort: an unavailable search engine or missing manual
+    # should not make install/onboarding pipelines fail.
+    return 0
 
 
 if __name__ == "__main__":
