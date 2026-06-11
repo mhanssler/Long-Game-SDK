@@ -15,14 +15,16 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
 ## Quick Start
 
-1. **Install dependencies:**
+1. **Install dependencies and local hardware permissions:**
    ```bash
-   # On Linux/macOS:
+   # On Linux/macOS. On Linux this may prompt for sudo once to install USB udev rules.
    bash scripts/install_sdk.sh
 
-   # On Windows (PowerShell):
+   # On Windows (PowerShell). This relaunches through UAC as Administrator when needed.
    .\scripts\install_sdk.ps1
    ```
+
+   The installer is intentionally interactive when OS-level USB permissions are required, so users should not have to copy/paste separate LabJack or udev commands.
 
 2. **Verify Environment:**
    Before running tests, verify your VISA/Instrument drivers:

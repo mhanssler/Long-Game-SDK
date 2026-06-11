@@ -28,9 +28,9 @@ echo "Syncing SDK environment..."
 uv sync
 
 # 3. Install optional vendor runtimes needed by detected/common lab gear.
-# This is non-fatal because udev permissions may require an interactive sudo.
+# On Linux this may prompt for sudo once to install USB udev permissions.
 if [ -x "./scripts/install_labjack_exodriver.sh" ]; then
-    ./scripts/install_labjack_exodriver.sh || true
+    ./scripts/install_labjack_exodriver.sh
 fi
 
 echo "--- Installation complete! ---"
