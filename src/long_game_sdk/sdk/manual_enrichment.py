@@ -301,7 +301,7 @@ def merge_commands_into_schema(schema: dict[str, Any], commands: list[str], iden
     return schema, added, len(commands)
 
 
-def enrich_identity(identity: InstrumentIdentity, *, force: bool = False, search_limit: int = 8) -> EnrichmentResult:
+def enrich_identity(identity: InstrumentIdentity, *, force: bool = False, search_limit: int = 8, manual_url: str | None = None) -> EnrichmentResult:
     schema_path = ensure_schema(identity)
     errors: list[str] = []
     if schema_path is None:
@@ -314,7 +314,7 @@ def enrich_identity(identity: InstrumentIdentity, *, force: bool = False, search
     if schema.get("generated", {}).get("manual_enriched") and not force:
         return EnrichmentResult(identity, schema_path, None, schema.get("generated", {}).get("manual_url"), 0, int(schema.get("generated", {}).get("manual_command_count") or 0), ())
 
-    candidates = find_manual_candidates(identity, limit=search_limit)
+    candidates = [ManualCandidate(manual_url, "user supplied manual", 10_000)] if manual_url else find_manual_candidates(identity, limit=search_limit)
     if not candidates:
         return EnrichmentResult(identity, schema_path, None, None, 0, 0, ("No likely manual candidates found",))
     manual_path, manual_url, download_errors = download_manual(identity, candidates)
@@ -332,8 +332,22 @@ def enrich_identity(identity: InstrumentIdentity, *, force: bool = False, search
     return EnrichmentResult(identity, schema_path, manual_path, manual_url, added, total, tuple(errors))
 
 
-def enrich_all(*, force: bool = False, search_limit: int = 8) -> list[EnrichmentResult]:
-    return [enrich_identity(identity, force=force, search_limit=search_limit) for identity in discover_all() if identity.transport == "visa"]
+def enrich_all(*, force: bool = False, search_limit: int = 8, manual_url: str | None = None) -> list[EnrichmentResult]:
+    identities = [identity for identity in discover_all() if identity.transport == "visa"]
+    if manual_url and len(identities) != 1:
+        return [
+            EnrichmentResult(
+                identity,
+                ensure_schema(identity),
+                None,
+                manual_url,
+                0,
+                0,
+                ("--manual-url requires exactly one discovered VISA/SCPI instrument, or future --resource selection",),
+            )
+            for identity in identities
+        ]
+    return [enrich_identity(identity, force=force, search_limit=search_limit, manual_url=manual_url) for identity in identities]
 
 
 def _print_result(result: EnrichmentResult) -> None:
@@ -355,10 +369,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Find manuals and enrich generated Long Game SDK schemas.")
     parser.add_argument("--force", action="store_true", help="Re-run enrichment even if a schema is already manual_enriched")
     parser.add_argument("--limit", type=int, default=8, help="Manual search candidates per instrument")
+    parser.add_argument("--manual-url", help="Use a specific PDF/HTML manual URL instead of web search (currently for single-instrument setups)")
     args = parser.parse_args(argv)
 
     print("--- Long Game SDK Manual Driver Enrichment ---")
-    results = enrich_all(force=args.force, search_limit=args.limit)
+    results = enrich_all(force=args.force, search_limit=args.limit, manual_url=args.manual_url)
     for result in results:
         _print_result(result)
     if not results:
