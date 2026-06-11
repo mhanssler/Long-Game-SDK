@@ -8,7 +8,17 @@ echo "--- Installing Long Game SDK dependencies ---"
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source $HOME/.cargo/env
+    # uv's installer now defaults to ~/.local/bin (not ~/.cargo/bin).
+    if [ -f "$HOME/.local/bin/env" ]; then
+        # shellcheck disable=SC1091
+        source "$HOME/.local/bin/env"
+    elif [ -f "$HOME/.cargo/env" ]; then
+        # Backward compatibility with older installer behavior.
+        # shellcheck disable=SC1091
+        source "$HOME/.cargo/env"
+    else
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    fi
 else
     echo "uv is already installed."
 fi
@@ -17,5 +27,13 @@ fi
 echo "Syncing SDK environment..."
 uv sync
 
+# 3. Install optional vendor runtimes needed by detected/common lab gear.
+# This is non-fatal because udev permissions may require an interactive sudo.
+if [ -x "./scripts/install_labjack_exodriver.sh" ]; then
+    ./scripts/install_labjack_exodriver.sh || true
+fi
+
 echo "--- Installation complete! ---"
-echo "Run 'uv run lg-check' to verify your VISA/Instrument environment."
+echo "Run 'uv run lg-discover' to inventory equipment."
+echo "Run 'uv run lg-onboard' to ensure schemas/drivers exist."
+echo "Run 'uv run lg-safe' before and after live hardware tests."

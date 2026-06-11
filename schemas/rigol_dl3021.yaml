@@ -1,0 +1,51 @@
+# Long Game SDK - Rigol DL3021 DC Electronic Load
+
+device:
+  manufacturer: "Rigol"
+  model: "DL3021"
+  protocol: "SCPI"
+  version: "1.0.0"
+
+capabilities:
+  electronic_load:
+    modes: [CC, CV, CR, CP]
+    commands:
+      identify: "*IDN?"
+      reset: "*RST"
+      clear_status: "*CLS"
+      input_on: ":INPut ON"
+      input_off: ":INPut OFF"
+      get_input: ":INPut?"
+      set_mode: ":FUNCtion {mode}"
+      get_mode: ":FUNCtion?"
+      set_current: ":CURRent {value:.6f}"
+      get_current_setpoint: ":CURRent?"
+      set_voltage: ":VOLTage {value:.6f}"
+      get_voltage_setpoint: ":VOLTage?"
+      set_power: ":POWer {value:.6f}"
+      get_power_setpoint: ":POWer?"
+      set_resistance: ":RESistance {value:.6f}"
+      get_resistance_setpoint: ":RESistance?"
+      measure_voltage: ":MEASure:VOLTage?"
+      measure_current: ":MEASure:CURRent?"
+      measure_power: ":MEASure:POWer?"
+      get_system_error: ":SYSTem:ERRor?"
+
+constraints:
+  safe_defaults:
+    input: OFF
+  limits:
+    current: [0.0, 40.0]
+    voltage: [0.0, 150.0]
+    power: [0.0, 200.0]
+
+safety:
+  safe_state:
+    - ":INPut OFF"
+  verification:
+    - ":INPut?"
+    - ":MEASure:CURRent?"
+    - ":MEASure:POWer?"
+
+identification:
+  idn_pattern: "RIGOL.*DL3021.*"

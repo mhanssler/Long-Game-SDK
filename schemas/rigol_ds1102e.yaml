@@ -1,0 +1,45 @@
+# Long Game SDK - Rigol DS1102E Oscilloscope
+
+device:
+  manufacturer: "Rigol"
+  model: "DS1102E"
+  protocol: "SCPI"
+  version: "1.0.0"
+
+capabilities:
+  oscilloscope:
+    channels: [1, 2]
+    commands:
+      identify: "*IDN?"
+      reset: "*RST"
+      clear_status: "*CLS"
+      run: ":RUN"
+      stop: ":STOP"
+      single: ":SINGle"
+      autoscale: ":AUTOscale"
+      get_trigger_status: ":TRIGger:STATus?"
+      set_channel_display: ":CHANnel{channel}:DISPlay {state}"
+      get_channel_display: ":CHANnel{channel}:DISPlay?"
+      set_channel_scale: ":CHANnel{channel}:SCALe {value:.6f}"
+      get_channel_scale: ":CHANnel{channel}:SCALe?"
+      set_channel_offset: ":CHANnel{channel}:OFFSet {value:.6f}"
+      get_channel_offset: ":CHANnel{channel}:OFFSet?"
+      set_timebase_scale: ":TIMebase:SCALe {value:.9f}"
+      get_timebase_scale: ":TIMebase:SCALe?"
+      measure_vpp: ":MEASure:VPP? CHANnel{channel}"
+      measure_frequency: ":MEASure:FREQuency? CHANnel{channel}"
+      measure_period: ":MEASure:PERiod? CHANnel{channel}"
+
+constraints:
+  channels: [1, 2]
+
+safety:
+  safe_state: []
+  notes: "Scope is treated as read-only/non-energizing by default. Do not autoscale during automated safe-state."
+  verification:
+    - ":CHANnel1:DISPlay?"
+    - ":CHANnel2:DISPlay?"
+    - ":TRIGger:STATus?"
+
+identification:
+  idn_pattern: "Rigol Technologies.*DS1102E.*"

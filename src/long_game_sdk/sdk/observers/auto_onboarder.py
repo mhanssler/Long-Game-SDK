@@ -44,7 +44,7 @@ class AutoOnboarder:
             
             # This calls the scraper script we previously created
             # We'll pass the model name as an argument
-            subprocess.run(["python3", "/Users/morgan/datasheet_scraper.py", "--model", model], check=True)
+            subprocess.run(["uv", "run", "/Users/morgan/datasheet_scraper.py", "--model", model], check=True)
             
         except Exception as e:
             logger.error(f"Onboarding failed for {instrument_id}: {e}")

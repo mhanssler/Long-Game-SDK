@@ -1,0 +1,37 @@
+# Long Game SDK - LabJack U3
+
+device:
+  manufacturer: "LabJack"
+  model: "U3"
+  protocol: "USB/LabJackPython"
+  version: "1.0.0"
+
+capabilities:
+  daq:
+    analog_inputs: [0, 1, 2, 3]
+    analog_outputs: [0, 1]
+    digital_io: [0, 1, 2, 3, 4, 5, 6, 7]
+    driver_module: "long_game_sdk.sdk.drivers.labjack_u3"
+    commands:
+      read_ain: "driver.read_ain(channel={channel})"
+      set_dac: "driver.set_dac(channel={channel}, volts={volts})"
+      set_fio: "driver.set_fio(channel={channel}, state={state})"
+      get_fio: "driver.get_fio(channel={channel})"
+      safe_state: "driver.safe_state()"
+
+constraints:
+  analog_input_voltage: [-10.0, 10.0]
+  analog_output_voltage: [0.0, 5.0]
+  digital_state: [0, 1]
+
+safety:
+  safe_state:
+    - "Set DAC0 to 0 V"
+    - "Set DAC1 to 0 V"
+  verification:
+    - "Read DAC/safe-state confirmation through LabJack driver"
+
+identification:
+  usb_vendor_id: "0cd5"
+  usb_product_id: "0003"
+  idn_pattern: "LabJack.*U3.*"
