@@ -51,7 +51,7 @@ def _safe_queries(schema: dict[str, Any]) -> list[str]:
             # Skip parameterized queries in smoke; they need user/test context.
             if "{" in command or "}" in command:
                 continue
-            if name in {"identify", "get_event_status", "get_operation_complete", "get_system_error", "get_output", "get_input", "read"}:
+            if name in {"identify", "get_event_status", "get_operation_complete", "get_output", "get_input", "read"}:
                 queries.append(command)
     deduped: list[str] = []
     for query in ["*IDN?", *queries]:
