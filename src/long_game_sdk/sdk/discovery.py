@@ -96,7 +96,12 @@ def discover_usb() -> list[InstrumentIdentity]:
         return []
 
     identities: list[InstrumentIdentity] = []
-    for device in usb.core.find(find_all=True):  # type: ignore[name-defined]
+    try:
+        devices = usb.core.find(find_all=True)  # type: ignore[name-defined]
+    except Exception:
+        return []
+
+    for device in devices:
         vendor_id = f"{device.idVendor:04x}"
         product_id = f"{device.idProduct:04x}"
         resource = f"USB::{vendor_id}::{product_id}::bus{device.bus}-addr{device.address}"
