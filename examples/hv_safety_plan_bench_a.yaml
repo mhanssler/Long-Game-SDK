@@ -1,0 +1,57 @@
+rig:
+  name: bench-a
+  dut_type: hv-pcba
+  dut:
+    name: inverter-control-board
+    serial: DUT-HV-001
+  instruments:
+    - name: main_psu
+      expected_model: Rigol DP832
+      connection: USB0::0x1AB1::0x0E11::DP8C000000000::INSTR
+    - name: electronic_load
+      expected_model: Rigol DL3021
+      connection: USB0::0x1AB1::0x0E11::DL3C000000000::INSTR
+runtime:
+  operator: ""
+  dut_serial: DUT-HV-001
+  test_location: Oakland bench A
+safety_plan:
+  reviewer: ""
+  max_voltage_v: 420
+  max_current_a: 8
+  energy_sources:
+    - 420 VDC battery simulator
+    - 24 V auxiliary supply
+  hazards:
+    - Stored energy in DC link capacitors
+    - Shock hazard above 50 VDC during probing or fixture access
+    - Arc flash or tool damage from incorrect probe placement
+  ppe:
+    - Safety glasses
+    - Class 0 voltage-rated gloves when exposed HV is present
+    - Insulated tools for HV fixture adjustments
+  estop:
+    location: Front-left mushroom switch on bench frame
+    verification: Press E-stop and confirm PSU output relay opens before energizing DUT.
+  disconnects:
+    - Bench DC disconnect within operator reach
+    - Battery simulator contactor opened by E-stop chain
+  discharge:
+    method: Use rated bleeder fixture across HV bus after source shutdown.
+    verification: Verify bus below 50 V with CAT III DMM before handling DUT or fixture.
+  interlocks:
+    - Fixture lid switch closed before HV enable
+    - Area rope line installed and observer outside boundary
+  safe_state:
+    - All PSU outputs OFF before connect/disconnect
+    - Electronic load input OFF before wiring changes
+    - DUT contactors open before removing covers
+    - Run lg-safe before and after live hardware tests
+  pre_job_briefing:
+    - Review shock boundaries and no-touch zones
+    - Assign one operator and one observer
+    - Confirm stop-work words and E-stop location
+  stop_work_criteria:
+    - Unexpected smell, smoke, sound, heat, or visible arcing
+    - Measured voltage or current exceeds configured limits
+    - Interlock bypass, damaged insulation, or uncertain wiring state

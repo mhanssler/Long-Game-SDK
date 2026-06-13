@@ -37,7 +37,15 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
    `lg-enrich` identifies discovered VISA/SCPI hardware, searches for likely programming/user manuals, caches the manual under `manuals/`, extracts SCPI-like commands, and merges them into the YAML schema without adding unsafe output-enabling behavior.
 
-3. **Run the bus observer:**
+3. **Generate readiness and safety deliverables:**
+   ```bash
+   uv run lg-preflight examples/lab_preflight_bench_a.yaml -o reports/lab-readiness.md
+   uv run lg-hv-safety-plan examples/hv_safety_plan_bench_a.yaml -o reports/hv-safety-plan.md
+   ```
+
+   `lg-preflight` validates bench readiness before test execution. `lg-hv-safety-plan` turns the same style of YAML bench config into a client-facing HV/PCBA test safety plan with hazards, PPE, E-stop/disconnect checks, discharge checks, interlocks, safe-state requirements, stop-work criteria, and sign-off fields.
+
+4. **Run the bus observer:**
    ```bash
    uv run python src/long_game_sdk/sdk/observers/auto_onboarder.py
    ```

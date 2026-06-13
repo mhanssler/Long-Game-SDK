@@ -1,0 +1,33 @@
+rig:
+  name: bench-a
+  dut_type: pcba
+  instruments:
+    - name: main_psu
+      expected_model: Rigol DP832
+      connection: USB0::0x1AB1::0x0E11::DP8C000000000::INSTR
+      checks:
+        - identity
+        - calibration_date
+        - output_disabled_on_start
+        - voltage_limit
+        - current_limit
+      safety:
+        calibration_due: 2027-06-01
+        output_query: ":OUTPut? CH1"
+        voltage_limit: "CH1 <= 5.50 V, CH2 <= 15.0 V, CH3 <= 15.0 V"
+        current_limit: "CH1 <= 1.0 A, CH2 <= 0.5 A, CH3 <= 0.5 A"
+    - name: scope
+      expected_model: Rigol DS1102E
+      connection: USB0::0x1AB1::0x0588::DS1ZA000000000::INSTR
+      checks:
+        - identity
+        - calibration_date
+      safety:
+        calibration_due: 2027-06-01
+runtime:
+  operator: ""
+  dut_serial: ""
+  output_dir: ./reports/preflight
+  required_env:
+    - LG_OPERATOR
+    - LG_DUT_SERIAL

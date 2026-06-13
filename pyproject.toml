@@ -21,6 +21,8 @@ lg-onboard = "long_game_sdk.sdk.registry:print_onboarding_report"
 lg-safe = "long_game_sdk.sdk.safety:main"
 lg-smoke = "long_game_sdk.sdk.smoke:main"
 lg-enrich = "long_game_sdk.sdk.manual_enrichment:main"
+lg-preflight = "long_game_sdk.sdk.preflight.cli:main"
+lg-hv-safety-plan = "long_game_sdk.sdk.hv_safety_plan:main"
 
 [build-system]
 requires = ["hatchling"]
