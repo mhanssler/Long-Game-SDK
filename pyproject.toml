@@ -17,12 +17,16 @@ dependencies = [
 [project.scripts]
 lg-check = "long_game_sdk.sdk.diagnostic:check_environment"
 lg-discover = "long_game_sdk.sdk.discovery:print_inventory"
+lg-auto-onboard = "long_game_sdk.sdk.observers.auto_onboarder:main"
 lg-onboard = "long_game_sdk.sdk.registry:print_onboarding_report"
 lg-safe = "long_game_sdk.sdk.safety:main"
 lg-smoke = "long_game_sdk.sdk.smoke:main"
 lg-enrich = "long_game_sdk.sdk.manual_enrichment:main"
 lg-preflight = "long_game_sdk.sdk.preflight.cli:main"
+lg-audit = "long_game_sdk.sdk.diagnostic_audit:main"
 lg-hv-safety-plan = "long_game_sdk.sdk.hv_safety_plan:main"
+lg-test-plan = "long_game_sdk.sdk.requirements_to_test_plan:main"
+lg-bench-bom = "long_game_sdk.sdk.bench_bom:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -30,3 +34,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/long_game_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "requirement(id): generated requirement traceability marker",
+    "functional: functional requirement verification",
+    "performance: performance requirement verification",
+    "safety: safety requirement verification",
+    "interface: interface/communications requirement verification",
+    "low: low priority requirement",
+    "medium: medium priority requirement",
+    "high: high priority requirement",
+    "safety_critical: safety-critical requirement",
+]

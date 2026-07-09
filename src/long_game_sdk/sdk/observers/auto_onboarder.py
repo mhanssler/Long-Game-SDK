@@ -1,60 +1,104 @@
-import subprocess
-import time
+from __future__ import annotations
+
+import argparse
 import logging
+import time
+from typing import Any, Sequence
+
 import pyvisa
-from pathlib import Path
+
+from long_game_sdk.sdk.discovery import InstrumentIdentity, _parse_idn
+from long_game_sdk.sdk.manual_enrichment import enrich_identity
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-class AutoOnboarder:
-    def __init__(self, poll_interval=60):
-        self.rm = pyvisa.ResourceManager()
-        self.poll_interval = poll_interval
-        self.known_instruments = set()
-        self.schemas_dir = Path("/Users/morgan/business/long-game-sdk/schemas")
 
-    def scan(self):
+class AutoOnboarder:
+    def __init__(self, poll_interval: int = 60, resource_manager: Any | None = None):
+        # Force the pure-Python backend for cross-platform parity with lg-discover.
+        # This avoids depending on NI-VISA being installed on Windows/macOS/Linux.
+        self.rm = resource_manager if resource_manager is not None else pyvisa.ResourceManager("@py")
+        self.poll_interval = poll_interval
+        self.known_instruments: set[str] = set()
+
+    def scan(self) -> None:
         try:
             current_instruments = set(self.rm.list_resources())
             new_instruments = current_instruments - self.known_instruments
-            
+
             for instrument_id in new_instruments:
-                logger.info(f"New hardware detected: {instrument_id}")
+                logger.info("New hardware detected: %s", instrument_id)
                 self.onboard(instrument_id)
+                # Mark as seen even if optional manual enrichment fails so a missing
+                # web result or offline network does not spam the operator forever.
                 self.known_instruments.add(instrument_id)
-                
-        except Exception as e:
-            logger.error(f"Scan error: {e}")
 
-    def onboard(self, instrument_id):
+        except Exception as exc:  # noqa: BLE001 - service should keep running
+            logger.error("Scan error: %s", exc)
+
+    def identify(self, instrument_id: str) -> InstrumentIdentity:
+        instrument = None
         try:
-            # 1. Get Device Identity
-            instr = self.rm.open_resource(instrument_id)
-            idn = instr.query("*IDN?").strip()
-            instr.close()
-            logger.info(f"Device identified: {idn}")
-            
-            # 2. Trigger Scraper
-            # We assume the model is in the IDN string
-            # In production, we'd use a more robust regex to extract the model
-            model = idn.split(',')[1]
-            logger.info(f"Searching for datasheet for: {model}")
-            
-            # This calls the scraper script we previously created
-            # We'll pass the model name as an argument
-            subprocess.run(["uv", "run", "/Users/morgan/datasheet_scraper.py", "--model", model], check=True)
-            
-        except Exception as e:
-            logger.error(f"Onboarding failed for {instrument_id}: {e}")
+            instrument = self.rm.open_resource(instrument_id)
+            try:
+                instrument.timeout = 3000
+            except Exception:
+                pass
+            idn = str(instrument.query("*IDN?")).strip().replace("\x00", "")
+            manufacturer, model, serial, firmware = _parse_idn(idn)
+            return InstrumentIdentity(
+                transport="visa",
+                resource=instrument_id,
+                manufacturer=manufacturer,
+                model=model,
+                serial=serial,
+                firmware=firmware,
+                idn=idn,
+            )
+        finally:
+            if instrument is not None:
+                try:
+                    instrument.close()
+                except Exception:
+                    pass
 
-    def run(self):
+    def onboard(self, instrument_id: str) -> None:
+        try:
+            identity = self.identify(instrument_id)
+            logger.info("Device identified: %s", identity.idn)
+            logger.info("Searching for manuals/schema enrichment for: %s", identity.model)
+            result = enrich_identity(identity)
+            if result.schema_path:
+                logger.info("Schema ready: %s", result.schema_path)
+            if result.manual_url:
+                logger.info("Manual candidate: %s", result.manual_url)
+            if result.errors:
+                for error in result.errors:
+                    logger.warning("Manual enrichment warning for %s: %s", instrument_id, error)
+        except Exception as exc:  # noqa: BLE001 - one device should not kill observer
+            logger.error("Onboarding failed for %s: %s", instrument_id, exc)
+
+    def run(self) -> None:
         logger.info("Auto-Onboarder service started.")
         while True:
             self.scan()
             time.sleep(self.poll_interval)
 
-if __name__ == "__main__":
-    onboarder = AutoOnboarder()
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Watch VISA resources and auto-onboard newly detected instruments.")
+    parser.add_argument("--poll-interval", type=int, default=60, help="Seconds between discovery scans")
+    parser.add_argument("--once", action="store_true", help="Run one scan and exit")
+    args = parser.parse_args(argv)
+
+    onboarder = AutoOnboarder(poll_interval=args.poll_interval)
+    if args.once:
+        onboarder.scan()
+        return
     onboarder.run()
+
+
+if __name__ == "__main__":
+    main()

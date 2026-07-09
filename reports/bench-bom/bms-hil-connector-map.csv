@@ -1,0 +1,3 @@
+connector_name,location,family,mating_connector,pin_count,keying,voltage_rating_v,current_rating_a,signal_type,cable_type,shielding_grounding,strain_relief,required_optional,risk_notes
+hv_positive,DUT HV input,Amphenol SurLok / equivalent,TBD,1,keyed,1000,120,HV power,orange HV cable,chassis bonding per safety review,fixture clamp,required,Verify touch-safe cover and creepage/clearance.
+lv_control_header,DUT LV connector,Molex Micro-Fit / equivalent,TBD,12,polarized,60,8,"LV power, CAN, enables, interlocks",shielded multi-conductor,shield drain to fixture ground,boot and cable tie,required,Prevent swapped CAN and enable pins.

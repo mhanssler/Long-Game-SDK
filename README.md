@@ -32,18 +32,24 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
    uv run lg-check
    uv run lg-discover
    uv run lg-onboard
+   uv run lg-auto-onboard --once
    uv run lg-enrich
    ```
 
-   `lg-enrich` identifies discovered VISA/SCPI hardware, searches for likely programming/user manuals, caches the manual under `manuals/`, extracts SCPI-like commands, and merges them into the YAML schema without adding unsafe output-enabling behavior.
+   `lg-enrich` identifies discovered VISA/SCPI hardware, searches for likely programming/user manuals, caches the manual under `manuals/`, extracts SCPI-like commands, and merges them into the YAML schema without adding unsafe output-enabling behavior. `lg-auto-onboard` watches for newly detected VISA instruments and runs this onboard/enrichment path in-process; use `--once` for a single scan during setup or debugging.
 
-3. **Generate readiness and safety deliverables:**
+3. **Generate readiness, safety, and verification deliverables:**
    ```bash
    uv run lg-preflight examples/lab_preflight_bench_a.yaml -o reports/lab-readiness.md
+   uv run lg-audit examples/lab_preflight_bench_a.yaml -o reports/diagnostic-audit.md
    uv run lg-hv-safety-plan examples/hv_safety_plan_bench_a.yaml -o reports/hv-safety-plan.md
+   uv run lg-bench-bom examples/bms_hil_bench_architecture.yaml -o reports/bench-bom --prefix bms-hil
+   uv run lg-test-plan examples/hil_bms_requirements.yaml -o reports/hil-bms-test-plan.md
+   uv run lg-test-plan examples/hil_bms_requirements.yaml -o reports/hil-bms-test-plan.md --pytest-dir tests/generated/hil_bms
+   uv run lg-test-plan examples/hil_bms_requirements.yaml -o reports/hil-bms-test-plan.md --pytest-dir tests/generated/hil_bms_bound --bench-config examples/hv_safety_plan_bench_a.yaml
    ```
 
-   `lg-preflight` validates bench readiness before test execution. `lg-hv-safety-plan` turns the same style of YAML bench config into a client-facing HV/PCBA test safety plan with hazards, PPE, E-stop/disconnect checks, discharge checks, interlocks, safe-state requirements, stop-work criteria, and sign-off fields.
+   `lg-preflight` validates bench readiness before test execution. `lg-audit` converts those readiness checks into a client-facing Diagnostic Audit with a health score, blockers, quick wins, and a 30-day improvement plan. `lg-hv-safety-plan` turns the same style of YAML bench config into a client-facing HV/PCBA test safety plan with hazards, PPE, E-stop/disconnect checks, discharge checks, interlocks, safe-state requirements, stop-work criteria, and sign-off fields. `lg-bench-bom` turns a test setup architecture YAML into a setup report, equipment BOM CSV, connector/harness map CSV, and generated bench config YAML. `lg-test-plan` converts structured requirements YAML into a verification test plan with requirement traceability, generated test case IDs, safety/preflight notes, evidence expectations, optional pytest skeletons via `--pytest-dir`, and bench-bound fixture bundles via `--bench-config`.
 
 4. **Run the bus observer:**
    ```bash

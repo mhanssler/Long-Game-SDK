@@ -1,0 +1,44 @@
+project:
+  client: Example Hardware Co.
+  product: 800 V BMS HiL Bench
+  subsystem: Battery management controller
+  phase: DVT
+  prepared_by: Long Game Technologies
+requirements:
+  - id: BMS-REQ-001
+    title: Pack voltage measurement accuracy
+    text: The BMS shall report pack voltage within ±0.5% of calibrated reference measurement from 100 VDC to 800 VDC.
+    source: BMS System Requirements v0.3 section 4.2.1
+    type: performance
+    verification_method: test
+    priority: high
+    acceptance_criteria:
+      pass_condition: Absolute voltage error is <= 0.5% at every commanded voltage point.
+      sample_points: [100, 250, 400, 600, 800]
+    instrumentation:
+      - HV programmable supply or simulator
+      - Calibrated DMM / DAQ voltage reference
+      - CAN interface
+    evidence:
+      - voltage_sweep_raw.csv
+      - voltage_accuracy_summary.md
+  - id: BMS-REQ-002
+    title: Over-voltage fault response
+    text: The BMS shall assert an over-voltage fault and command contactor open within 100 ms when simulated cell voltage exceeds configured threshold.
+    source: BMS System Requirements v0.3 section 5.1.4
+    type: safety
+    verification_method: test
+    priority: safety-critical
+    acceptance_criteria:
+      pass_condition: Fault asserted and contactor-open command observed within 100 ms.
+      timing_requirement_ms: 100
+    instrumentation:
+      - Cell simulator
+      - Logic analyzer or DAQ
+      - CAN interface
+    safety_controls:
+      - Verify simulator limits before test.
+      - Force safe-state before and after test.
+    evidence:
+      - fault_timing_capture.csv
+      - can_fault_log.asc
