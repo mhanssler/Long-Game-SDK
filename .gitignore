@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Long Game local hardware observer state
+instrument_state.json
+src/long_game_sdk/sdk/observers/instrument_state.json
