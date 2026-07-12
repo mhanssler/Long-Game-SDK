@@ -1,0 +1,30 @@
+schematic_context:
+  dut:
+    name: bms_controller
+    source_files:
+    - examples/guided_test_setup/bms_pin_map.csv
+    connectors:
+      J1:
+        pins:
+          '1':
+            net: VIN+
+            description: Input supply positive
+            signal_type: power
+            max_voltage_v: 60
+            max_current_a: 1
+          '2':
+            net: VIN-
+            description: Input supply return
+            signal_type: power_return
+            max_voltage_v: 0
+            max_current_a: 1
+          '7':
+            net: BMS_FAULT_N
+            description: Fault output to fixture logic
+            signal_type: open_drain_logic
+            max_voltage_v: 5
+            max_current_a: 0.01
+    test_points:
+      TP12:
+        net: CELL_SIM_1
+        description: Simulated cell 1 sense node

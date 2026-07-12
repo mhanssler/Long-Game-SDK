@@ -27,6 +27,7 @@ lg-audit = "long_game_sdk.sdk.diagnostic_audit:main"
 lg-hv-safety-plan = "long_game_sdk.sdk.hv_safety_plan:main"
 lg-test-plan = "long_game_sdk.sdk.requirements_to_test_plan:main"
 lg-bench-bom = "long_game_sdk.sdk.bench_bom:main"
+lg-schematic-import = "long_game_sdk.sdk.schematic_import:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,5 @@
+connector,pin,net,description,max_voltage_v,max_current_a,signal_type,test_point
+J1,1,VIN+,Input supply positive,60,1.0,power,
+J1,2,VIN-,Input supply return,0,1.0,power_return,
+J1,7,BMS_FAULT_N,Fault output to fixture logic,5,0.01,open_drain_logic,
+,,CELL_SIM_1,Simulated cell 1 sense node,,,,TP12
