@@ -1,0 +1,18 @@
+flash:
+  target: stm32f407
+  interface: stlink
+  transport: hla_swd
+  firmware: firmware/bms_controller.elf
+  format: elf
+  verify: true
+  reset: true
+  adapter_speed_khz: 4000
+  openocd:
+    interface_cfg: interface/stlink.cfg
+    target_cfg: target/stm32f4x.cfg
+  safety:
+    require_unpowered_outputs: true
+    notes:
+      - Confirm bench supply outputs are OFF before connecting SWD.
+      - Connect GND, SWDIO, SWCLK, NRST, and VTref/target power sense before flashing.
+      - Power DUT from a current-limited supply and run safe-state before flashing in a live bench.
