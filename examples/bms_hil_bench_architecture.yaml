@@ -15,6 +15,58 @@ requirements:
   - BMS-REQ-002
 
 instruments:
+  - name: cell_simulator
+    category: source
+    role: cell_voltage_source
+    purpose: Simulate isolated cell voltages, including cell over-voltage.
+    energizing: true
+    terminals:
+      CH1+:
+        signal_type: isolated_analog_source
+        isolation: isolated_channel
+        polarity: positive
+        max_voltage_v: 5.0
+        max_current_a: 0.1
+      CH1-:
+        signal_type: power_return
+        isolation: isolated_channel
+        polarity: negative
+        max_voltage_v: 5.0
+        max_current_a: 0.1
+    required_optional: required
+    quantity: 1
+    manufacturer: Pickering / Bloomy / equivalent
+    model: TBD
+    control_interface: ethernet_or_usb
+    calibration_required: true
+    safety_notes:
+      - All simulated-cell outputs OFF before connect/disconnect.
+  - name: logic_analyzer
+    category: measurement
+    role: fault_timing_capture
+    purpose: Capture the open-drain BMS fault output timing.
+    energizing: false
+    terminals:
+      D0:
+        signal_type: open_drain_logic
+        isolation: common_ground
+        polarity: signal
+        max_voltage_v: 5.0
+        max_current_a: 0.01
+      GND:
+        signal_type: power_return
+        isolation: common_ground
+        polarity: reference
+        max_voltage_v: 5.0
+        max_current_a: 1.0
+    required_optional: required
+    quantity: 1
+    manufacturer: Saleae / Digilent / equivalent
+    model: TBD
+    control_interface: usb
+    calibration_required: false
+    safety_notes:
+      - Confirm the input threshold and common-ground reference before connecting.
   - name: hv_supply
     category: power
     role: pack_voltage_source

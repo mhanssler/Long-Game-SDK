@@ -40,6 +40,7 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
 3. **Generate readiness, safety, and verification deliverables:**
    ```bash
+   uv run lg-safe examples/lab_preflight_bench_a.yaml
    uv run lg-preflight examples/lab_preflight_bench_a.yaml -o reports/lab-readiness.md
    uv run lg-audit examples/lab_preflight_bench_a.yaml -o reports/diagnostic-audit.md
    uv run lg-hv-safety-plan examples/hv_safety_plan_bench_a.yaml -o reports/hv-safety-plan.md
@@ -52,7 +53,7 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
    uv run lg-test-plan examples/hil_bms_requirements.yaml -o reports/hil-bms-test-plan.md --pytest-dir tests/generated/hil_bms_bound --bench-config examples/hv_safety_plan_bench_a.yaml
    ```
 
-   `lg-preflight` validates bench readiness before test execution. `lg-audit` converts those readiness checks into a client-facing Diagnostic Audit with a health score, blockers, quick wins, and a 30-day improvement plan. `lg-hv-safety-plan` turns the same style of YAML bench config into a client-facing HV/PCBA test safety plan with hazards, PPE, E-stop/disconnect checks, discharge checks, interlocks, safe-state requirements, stop-work criteria, and sign-off fields. `lg-bench-bom` turns a test setup architecture YAML into a setup report, equipment BOM CSV, connector/harness map CSV, and generated bench config YAML. `lg-schematic-import` converts curated pin maps, Altium CSVs, KiCad netlists, and text/PDF schematic notes into canonical `schematic_context` YAML for guided wiring. `lg-flash-openocd` validates OpenOCD flash configs and writes a dry-run flash plan by default; actual flashing requires `--execute --yes-i-confirm-target-wiring`. `lg-guide-test` combines requirements, bench config, schematic context, optional flash config, and optional pytest target into a deterministic `test-context-pack.yaml` plus an operator wiring/safety guide. `lg-test-plan` converts structured requirements YAML into a verification test plan with requirement traceability, generated test case IDs, safety/preflight notes, evidence expectations, optional pytest skeletons via `--pytest-dir`, and bench-bound fixture bundles via `--bench-config`.
+   With a bench/preflight config, `lg-safe` fails closed when declared equipment is absent or unbound; no-config mode is discovery-only and an empty scan is not evidence that an expected bench is safe. `lg-preflight` validates typed voltage/current limits, instrument identity, reachable setpoints, and source output state before execution. `lg-audit` converts readiness checks into a client-facing Diagnostic Audit. `lg-hv-safety-plan` generates HV/PCBA safety plans. `lg-bench-bom` produces setup reports, BOMs, harness maps, and bench YAML. `lg-schematic-import` converts curated pin maps, Altium CSVs, KiCad netlists, and text/PDF notes into canonical schematic context while rejecting conflicts, invalid ratings, empty extraction, and oversized inputs. `lg-flash-openocd` is dry-run only: it writes a proposed-command plan and refuses every live execution request pending a hardened sandbox. Its report is not evidence of target identity, flashing, or verification. `lg-guide-test` only renders approved, revision-matched connection records and never infers actionable wiring from net names. `lg-test-plan` generates traceable verification plans and optional pytest bundles.
 
 4. **Run the bus observer:**
    ```bash
@@ -60,4 +61,18 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
    ```
 
 ## Development
-This project is built using Python 3.13+ and `uv` for dependency management.
+
+This project uses `uv` and supports Python 3.11+; development targets Python 3.13.
+
+```bash
+uv sync --group dev
+PYTHONPATH=src uv run pytest -q
+uv run ruff check .
+uv run mypy src
+```
+
+Live hardware tests are marked `hardware` and excluded from the default suite. Run them deliberately, on a safe bench, with:
+
+```bash
+PYTHONPATH=src uv run pytest -m hardware
+```

@@ -1,4 +1,5 @@
 schematic_context:
+  revision: SCH-BMS-004-C
   dut:
     name: bms_controller
     source_files:
@@ -10,21 +11,73 @@ schematic_context:
             net: VIN+
             description: Input supply positive
             signal_type: power
+            isolation: common_ground
+            polarity: positive
             max_voltage_v: 60
             max_current_a: 1
           '2':
             net: VIN-
             description: Input supply return
             signal_type: power_return
-            max_voltage_v: 0
+            isolation: common_ground
+            polarity: reference
+            max_voltage_v: 5
             max_current_a: 1
           '7':
             net: BMS_FAULT_N
             description: Fault output to fixture logic
             signal_type: open_drain_logic
+            isolation: common_ground
+            polarity: signal
             max_voltage_v: 5
             max_current_a: 0.01
     test_points:
       TP12:
         net: CELL_SIM_1
         description: Simulated cell 1 sense node
+        signal_type: isolated_analog_source
+        isolation: isolated_channel
+        polarity: positive
+        max_voltage_v: 5.0
+        max_current_a: 0.1
+      TP13:
+        net: CELL_SIM_1_RETURN
+        description: Simulated cell 1 return
+        signal_type: power_return
+        isolation: isolated_channel
+        polarity: negative
+        max_voltage_v: 5.0
+        max_current_a: 0.1
+  connections:
+  - instrument: logic_analyzer
+    terminal: D0
+    destination:
+      connector: J1
+      pin: '7'
+      net: BMS_FAULT_N
+    reference:
+      instrument_terminal: GND
+      connector: J1
+      pin: '2'
+      net: VIN-
+    signal_type: open_drain_logic
+    max_voltage_v: 5.0
+    max_current_a: 0.01
+    isolation: common_ground
+    approved: true
+    source_revision: SCH-BMS-004-C
+  - instrument: cell_simulator
+    terminal: CH1+
+    destination:
+      test_point: TP12
+      net: CELL_SIM_1
+    reference:
+      instrument_terminal: CH1-
+      test_point: TP13
+      net: CELL_SIM_1_RETURN
+    signal_type: isolated_analog_source
+    max_voltage_v: 5.0
+    max_current_a: 0.1
+    isolation: isolated_channel
+    approved: true
+    source_revision: SCH-BMS-004-C

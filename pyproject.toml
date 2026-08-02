@@ -14,6 +14,14 @@ dependencies = [
     "zeroconf",
 ]
 
+[dependency-groups]
+dev = [
+    "mypy>=1.17.0",
+    "pytest>=8.4.0",
+    "ruff>=0.12.0",
+    "types-pyyaml>=6.0.12.20250516",
+]
+
 [project.scripts]
 lg-check = "long_game_sdk.sdk.diagnostic:check_environment"
 lg-discover = "long_game_sdk.sdk.discovery:print_inventory"
@@ -40,7 +48,10 @@ packages = ["src/long_game_sdk"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not hardware'"
 markers = [
+    "hardware: requires connected physical lab hardware; excluded by default",
+    "rigol_dp832: requires a Rigol DP832 power supply",
     "requirement(id): generated requirement traceability marker",
     "functional: functional requirement verification",
     "performance: performance requirement verification",
@@ -51,3 +62,17 @@ markers = [
     "high: high priority requirement",
     "safety_critical: safety-critical requirement",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
+exclude = ["tests/generated/"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -12,6 +13,24 @@ import yaml
 
 class SchematicImportError(ValueError):
     """Raised when a schematic/netlist import cannot produce safe context."""
+
+
+MAX_INPUT_BYTES = 1_000_000
+
+
+def _check_input_size(path: Path) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise SchematicImportError(f"cannot read schematic input {path}: {exc}") from exc
+    if size > MAX_INPUT_BYTES:
+        raise SchematicImportError(f"schematic input exceeds {MAX_INPUT_BYTES} bytes: {path}")
+
+
+def _require_records(context: Mapping[str, Any]) -> None:
+    dut = _dut(context)
+    if not dut.get("connectors") and not dut.get("test_points"):
+        raise SchematicImportError("schematic import produced no connector or test-point records")
 
 
 def _clean(value: Any) -> str:
@@ -27,13 +46,15 @@ def _first(row: Mapping[str, Any], *names: str) -> str:
     return ""
 
 
-def _number(value: str) -> int | float | None:
+def _number(value: str, label: str) -> int | float | None:
     if value == "":
         return None
     try:
         parsed = float(value)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise SchematicImportError(f"{label} must be numeric") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise SchematicImportError(f"{label} must be finite and non-negative")
     return int(parsed) if parsed.is_integer() else parsed
 
 
@@ -70,6 +91,13 @@ def _add_connector_pin(
     connectors = _dut(context).setdefault("connectors", {})
     connector_entry = connectors.setdefault(connector, {"pins": {}})
     pins = connector_entry.setdefault("pins", {})
+    existing = pins.get(str(pin))
+    if existing is not None:
+        if not isinstance(existing, Mapping) or existing.get("net") != net:
+            raise SchematicImportError(
+                f"conflicting mapping for {connector} pin {pin}: {getattr(existing, 'get', lambda *_: None)('net')} vs {net}"
+            )
+        return
     pin_entry: dict[str, Any] = {"net": net}
     if description:
         pin_entry["description"] = description
@@ -94,12 +122,19 @@ def _add_test_point(
     entry: dict[str, Any] = {"net": net}
     if description:
         entry["description"] = description
-    _dut(context).setdefault("test_points", {})[test_point] = entry
+    test_points = _dut(context).setdefault("test_points", {})
+    existing = test_points.get(test_point)
+    if existing is not None:
+        if not isinstance(existing, Mapping) or existing.get("net") != net:
+            raise SchematicImportError(f"conflicting mapping for test point {test_point}")
+        return
+    test_points[test_point] = entry
 
 
 def import_pin_map_csv(path: str | Path, dut_name: str = "dut") -> dict[str, Any]:
     """Import a curated connector/test-point CSV into canonical schematic context."""
     csv_path = Path(path)
+    _check_input_size(csv_path)
     context = _base_context(csv_path, dut_name)
     with csv_path.open(newline="") as handle:
         reader = csv.DictReader(handle)
@@ -112,8 +147,8 @@ def import_pin_map_csv(path: str | Path, dut_name: str = "dut") -> dict[str, Any
             test_point = _first(row, "test_point", "tp", "testpoint")
             description = _first(row, "description", "pin_name", "notes")
             signal_type = _first(row, "signal_type", "electrical_type", "type")
-            max_voltage = _number(_first(row, "max_voltage_v", "voltage_rating_v", "max_voltage"))
-            max_current = _number(_first(row, "max_current_a", "current_rating_a", "max_current"))
+            max_voltage = _number(_first(row, "max_voltage_v", "voltage_rating_v", "max_voltage"), "max_voltage_v")
+            max_current = _number(_first(row, "max_current_a", "current_rating_a", "max_current"), "max_current_a")
             if test_point:
                 _add_test_point(context, test_point, net, description=description)
             elif connector and pin and net:
@@ -131,6 +166,7 @@ def import_pin_map_csv(path: str | Path, dut_name: str = "dut") -> dict[str, Any
                 raise SchematicImportError(
                     f"row {index} must include connector+pin or test_point with net"
                 )
+    _require_records(context)
     return context
 
 
@@ -167,6 +203,7 @@ def _is_test_point(ref: str, value: str) -> bool:
 def import_kicad_netlist(path: str | Path, dut_name: str = "dut") -> dict[str, Any]:
     """Import a KiCad generic XML netlist into canonical schematic context."""
     netlist_path = Path(path)
+    _check_input_size(netlist_path)
     try:
         root = ET.fromstring(netlist_path.read_text())
     except (OSError, ET.ParseError) as exc:
@@ -186,21 +223,23 @@ def import_kicad_netlist(path: str | Path, dut_name: str = "dut") -> dict[str, A
                 _add_test_point(context, ref, net_name)
             elif _is_connector(ref, value) and pin:
                 _add_connector_pin(context, ref, pin, net_name)
+    _require_records(context)
     return context
 
 
 _CONNECTOR_LINE = re.compile(
-    r"(?:connector\s+)?(?P<connector>[JP]\w*)\s+(?:pin\s+)?(?P<pin>\w+)\s+(?:net\s+)?(?P<net>[A-Za-z0-9_+\-./]+)(?P<rest>.*)",
+    r"^(?:connector\s+)?(?P<connector>[JP]\w*)\s+(?:pin\s+)?(?P<pin>\w+)\s+(?:net\s+)?(?P<net>[A-Za-z0-9_+\-./]+)(?P<rest>.*)",
     re.IGNORECASE,
 )
 _TP_LINE = re.compile(
-    r"(?P<tp>TP\w*)\s+(?:net\s+)?(?P<net>[A-Za-z0-9_+\-./]+)(?P<rest>.*)",
+    r"^(?P<tp>TP\w*)\s+(?:net\s+)?(?P<net>[A-Za-z0-9_+\-./]+)(?P<rest>.*)",
     re.IGNORECASE,
 )
 _MAX_VOLTAGE = re.compile(r"max\s+(?P<voltage>\d+(?:\.\d+)?)\s*V", re.IGNORECASE)
 
 
 def _extract_text(path: Path) -> str:
+    _check_input_size(path)
     if path.suffix.lower() == ".pdf":
         try:
             from pypdf import PdfReader
@@ -233,7 +272,7 @@ def import_text_schematic(path: str | Path, dut_name: str = "dut") -> dict[str, 
         if conn_match:
             rest = conn_match.group("rest").strip()
             voltage_match = _MAX_VOLTAGE.search(rest)
-            max_voltage = _number(voltage_match.group("voltage")) if voltage_match else None
+            max_voltage = _number(voltage_match.group("voltage"), "max_voltage_v") if voltage_match else None
             _add_connector_pin(
                 context,
                 conn_match.group("connector").upper(),
@@ -242,6 +281,7 @@ def import_text_schematic(path: str | Path, dut_name: str = "dut") -> dict[str, 
                 description=rest,
                 max_voltage_v=max_voltage,
             )
+    _require_records(context)
     return context
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -9,6 +10,17 @@ import yaml
 
 class GuidedSetupError(ValueError):
     """Raised when a guided setup context cannot be built safely."""
+
+
+_ALLOWED_ISOLATION = frozenset({"common_ground", "isolated_channel", "differential", "earth_referenced"})
+_ALLOWED_POLARITY = frozenset({"positive", "negative", "signal", "reference"})
+
+
+def _canonical_enum(mapping: Mapping[str, Any], field: str, allowed: frozenset[str], label: str) -> str:
+    value = _required_text(mapping.get(field), f"{label} {field}")
+    if value not in allowed:
+        raise GuidedSetupError(f"{label} {field} {value!r} is unsupported; allowed values: {sorted(allowed)}")
+    return value
 
 
 def _load_yaml(path: str | Path) -> Any:
@@ -39,22 +51,291 @@ def _find_requirement(requirements_data: Mapping[str, Any], requirement_id: str)
 
 def _bench_summary(bench_data: Mapping[str, Any]) -> dict[str, Any]:
     bench = _mapping(bench_data.get("bench", {}), "bench")
+    raw_instruments = bench_data.get("instruments")
+    if not isinstance(raw_instruments, list) or not raw_instruments:
+        raise GuidedSetupError("bench instruments must be a non-empty list")
+    instruments: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, raw_instrument in enumerate(raw_instruments, start=1):
+        instrument = _mapping(raw_instrument, f"bench instruments[{index}]")
+        name = _required_text(instrument.get("name"), f"bench instruments[{index}] name")
+        name_key = name.casefold()
+        if name_key in names:
+            raise GuidedSetupError(f"duplicate bench instrument name: {name!r}")
+        names.add(name_key)
+        terminals = instrument.get("terminals", {})
+        if not isinstance(terminals, Mapping):
+            raise GuidedSetupError(f"bench instrument {name!r} terminals must be a mapping")
+        instruments.append(dict(instrument))
     return {
         "name": bench.get("name", "unnamed_bench"),
         "dut": bench.get("dut"),
         "evidence_root": bench.get("evidence_root", "reports/guided-tests"),
-        "instruments": [item for item in _list(bench_data.get("instruments")) if isinstance(item, Mapping)],
+        "instruments": instruments,
         "connectors": [item for item in _list(bench_data.get("connectors")) if isinstance(item, Mapping)],
         "safety_controls": _list(bench_data.get("safety_controls")),
     }
 
 
-def _schematic_summary(schematic_data: Mapping[str, Any]) -> Mapping[str, Any]:
+def _required_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise GuidedSetupError(f"{label} requires a non-empty string")
+    return value.strip()
+
+
+def _validate_endpoint(
+    endpoint: Mapping[str, Any],
+    *,
+    dut: Mapping[str, Any],
+    fixture: Mapping[str, Any] | None,
+    label: str,
+) -> Mapping[str, Any]:
+    net = _required_text(endpoint.get("net"), f"{label} net")
+    connector = endpoint.get("connector")
+    pin = endpoint.get("pin")
+    test_point = endpoint.get("test_point")
+    has_connector = connector is not None or pin is not None
+    has_test_point = test_point is not None
+    if has_connector == has_test_point:
+        raise GuidedSetupError(f"{label} requires exactly one connector and pin or test_point")
+
+    scope = endpoint.get("scope", "dut")
+    if scope not in ("dut", "fixture"):
+        raise GuidedSetupError(f"{label} scope must be 'dut' or 'fixture'")
+    canonical = dut if scope == "dut" else fixture
+    if canonical is None:
+        raise GuidedSetupError(f"{label} references fixture but no canonical fixture mapping exists")
+
+    if has_connector:
+        connector_name = _required_text(connector, f"{label} connector")
+        pin_name = _required_text(pin, f"{label} pin")
+        connectors = _mapping(canonical.get("connectors", {}), f"schematic_context.{scope}.connectors")
+        if connector_name not in connectors:
+            raise GuidedSetupError(f"{label} connector {connector_name!r} has no canonical mapping")
+        connector_data = _mapping(connectors[connector_name], f"canonical connector {connector_name}")
+        pins = _mapping(connector_data.get("pins", {}), f"canonical connector {connector_name} pins")
+        pin_data = pins.get(pin_name)
+        if not isinstance(pin_data, Mapping):
+            raise GuidedSetupError(f"{label} pin {connector_name}.{pin_name} has no canonical mapping")
+        canonical_net = _required_text(pin_data.get("net"), f"canonical pin {connector_name}.{pin_name} net")
+        endpoint_data = pin_data
+    else:
+        test_point_name = _required_text(test_point, f"{label} test point")
+        test_points = _mapping(canonical.get("test_points", {}), f"schematic_context.{scope}.test_points")
+        point_data = test_points.get(test_point_name)
+        if not isinstance(point_data, Mapping):
+            raise GuidedSetupError(f"{label} test point {test_point_name!r} has no canonical mapping")
+        canonical_net = _required_text(point_data.get("net"), f"canonical test point {test_point_name} net")
+        endpoint_data = point_data
+    if net != canonical_net:
+        raise GuidedSetupError(f"{label} net {net!r} contradicts canonical net {canonical_net!r}")
+    return endpoint_data
+
+
+def _finite_limit(mapping: Mapping[str, Any], field: str, label: str) -> float:
+    value = mapping.get(field)
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise GuidedSetupError(f"{label} requires finite non-negative numeric {field}")
+    return float(value)
+
+
+def _canonical_terminal(instrument: Mapping[str, Any], terminal_name: str, label: str) -> Mapping[str, Any]:
+    terminals = _mapping(instrument.get("terminals", {}), f"bench instrument {instrument.get('name')} terminals")
+    terminal = terminals.get(terminal_name)
+    if not isinstance(terminal, Mapping):
+        raise GuidedSetupError(f"{label} {terminal_name!r} has no canonical bench terminal definition")
+    return terminal
+
+
+def _endpoint_key(endpoint: Mapping[str, Any]) -> tuple[str, str, str]:
+    scope = str(endpoint.get("scope", "dut")).casefold()
+    if endpoint.get("test_point") is not None:
+        return scope, "test_point", str(endpoint["test_point"]).casefold()
+    return scope, str(endpoint.get("connector", "")).casefold(), str(endpoint.get("pin", "")).casefold()
+
+
+def _schematic_summary(
+    schematic_data: Mapping[str, Any], *, instruments: Mapping[str, Mapping[str, Any]]
+) -> Mapping[str, Any]:
     context = _mapping(schematic_data.get("schematic_context"), "schematic_context")
     dut = _mapping(context.get("dut"), "schematic_context.dut")
+    fixture_raw = context.get("fixture")
+    fixture = _mapping(fixture_raw, "schematic_context.fixture") if fixture_raw is not None else None
     if not dut.get("connectors") and not dut.get("test_points"):
         raise GuidedSetupError("schematic context must include connectors or test_points")
-    return {"dut": dict(dut)}
+    revision = str(context.get("revision", "")).strip()
+    connections = _list(context.get("connections"))
+    source_terminals: set[tuple[str, str]] = set()
+    reference_terminals: set[tuple[str, str]] = set()
+    destination_endpoints: set[tuple[str, str, str]] = set()
+    reference_endpoints: set[tuple[str, str, str]] = set()
+    for index, raw_connection in enumerate(connections, start=1):
+        connection = _mapping(raw_connection, f"schematic_context.connections[{index}]")
+        if connection.get("approved") is not True:
+            raise GuidedSetupError(f"connection {index} must be explicitly approved")
+        source_revision = str(connection.get("source_revision", "")).strip()
+        if not revision or source_revision != revision:
+            raise GuidedSetupError(
+                f"connection {index} source_revision must match schematic_context.revision"
+            )
+        for field in ("instrument", "terminal", "signal_type", "isolation"):
+            _required_text(connection.get(field), f"connection {index} {field}")
+        instrument_name = str(connection["instrument"])
+        instrument = instruments.get(instrument_name)
+        if instrument is None:
+            raise GuidedSetupError(
+                f"connection {index} instrument {instrument_name!r} is not in bench inventory"
+            )
+        if not isinstance(instrument.get("energizing"), bool):
+            raise GuidedSetupError(
+                f"bench instrument {instrument_name!r} requires explicit boolean energizing classification"
+            )
+        source_terminal_name = str(connection["terminal"])
+        source_terminal = _canonical_terminal(
+            instrument, source_terminal_name, f"connection {index} terminal"
+        )
+        reference_instrument_name = _required_text(
+            connection.get("reference", {}).get("instrument", instrument_name),
+            f"connection {index} reference instrument",
+        ) if isinstance(connection.get("reference"), Mapping) else instrument_name
+        reference_instrument = instruments.get(reference_instrument_name)
+        if reference_instrument is None:
+            raise GuidedSetupError(
+                f"connection {index} reference instrument {reference_instrument_name!r} is not in bench inventory"
+            )
+        destination = _mapping(connection.get("destination"), f"connection {index} destination")
+        reference = _mapping(connection.get("reference"), f"connection {index} reference")
+        reference_terminal_name = _required_text(
+            reference.get("instrument_terminal"), f"connection {index} reference instrument_terminal"
+        )
+        reference_terminal = _canonical_terminal(
+            reference_instrument, reference_terminal_name, f"connection {index} reference terminal"
+        )
+        destination_data = _validate_endpoint(
+            destination, dut=dut, fixture=fixture, label=f"connection {index} destination"
+        )
+        reference_data = _validate_endpoint(
+            reference, dut=dut, fixture=fixture, label=f"connection {index} reference"
+        )
+
+        source_key = (instrument_name.casefold(), source_terminal_name.casefold())
+        reference_key = (reference_instrument_name.casefold(), reference_terminal_name.casefold())
+        destination_key = _endpoint_key(destination)
+        reference_endpoint_key = _endpoint_key(reference)
+        if source_key in source_terminals:
+            raise GuidedSetupError(f"connection {index} reuses source terminal {instrument_name}.{source_terminal_name}")
+        if reference_key in reference_terminals:
+            raise GuidedSetupError(
+                f"connection {index} reuses reference terminal {reference_instrument_name}.{reference_terminal_name}"
+            )
+        if destination_key in destination_endpoints:
+            raise GuidedSetupError(f"connection {index} reuses a destination endpoint")
+        if reference_endpoint_key in reference_endpoints:
+            raise GuidedSetupError(f"connection {index} reuses a reference endpoint")
+        if source_key in reference_terminals or reference_key in source_terminals or source_key == reference_key:
+            raise GuidedSetupError(f"connection {index} has conflicting source/reference terminal topology")
+        if (
+            destination_key in reference_endpoints
+            or reference_endpoint_key in destination_endpoints
+            or destination_key == reference_endpoint_key
+        ):
+            raise GuidedSetupError(f"connection {index} has conflicting destination/reference endpoint topology")
+        source_terminals.add(source_key)
+        reference_terminals.add(reference_key)
+        destination_endpoints.add(destination_key)
+        reference_endpoints.add(reference_endpoint_key)
+
+        isolation = _canonical_enum(connection, "isolation", _ALLOWED_ISOLATION, f"connection {index}")
+        source_isolation = _canonical_enum(
+            source_terminal, "isolation", _ALLOWED_ISOLATION, f"connection {index} source terminal"
+        )
+        destination_isolation = _canonical_enum(
+            destination_data, "isolation", _ALLOWED_ISOLATION, f"connection {index} destination endpoint"
+        )
+        reference_terminal_isolation = _canonical_enum(
+            reference_terminal, "isolation", _ALLOWED_ISOLATION, f"connection {index} reference terminal"
+        )
+        reference_endpoint_isolation = _canonical_enum(
+            reference_data, "isolation", _ALLOWED_ISOLATION, f"connection {index} reference endpoint"
+        )
+        if any(value != isolation for value in (
+            source_isolation, destination_isolation,
+            reference_terminal_isolation, reference_endpoint_isolation,
+        )):
+            raise GuidedSetupError(f"connection {index} isolation is incompatible with canonical wiring metadata")
+
+        source_polarity = _canonical_enum(
+            source_terminal, "polarity", _ALLOWED_POLARITY, f"connection {index} source terminal"
+        )
+        destination_polarity = _canonical_enum(
+            destination_data, "polarity", _ALLOWED_POLARITY, f"connection {index} destination endpoint"
+        )
+        reference_polarity = _canonical_enum(
+            reference_terminal, "polarity", _ALLOWED_POLARITY, f"connection {index} reference terminal"
+        )
+        endpoint_reference_polarity = _canonical_enum(
+            reference_data, "polarity", _ALLOWED_POLARITY, f"connection {index} reference endpoint"
+        )
+        if source_polarity != destination_polarity or reference_polarity != endpoint_reference_polarity:
+            raise GuidedSetupError(f"connection {index} polarity is incompatible with canonical wiring metadata")
+
+        signal_type = str(connection["signal_type"])
+        for canonical, label in (
+            (source_terminal, "source terminal"),
+            (destination_data, "destination endpoint"),
+        ):
+            canonical_signal = _required_text(
+                canonical.get("signal_type"), f"connection {index} canonical {label} signal_type"
+            )
+            if signal_type != canonical_signal:
+                raise GuidedSetupError(
+                    f"connection {index} signal_type {signal_type!r} contradicts canonical {label} "
+                    f"signal_type {canonical_signal!r}"
+                )
+        reference_signal = _required_text(
+            reference_terminal.get("signal_type"),
+            f"connection {index} canonical reference terminal signal_type",
+        )
+        endpoint_reference_signal = _required_text(
+            reference_data.get("signal_type"),
+            f"connection {index} canonical reference endpoint signal_type",
+        )
+        if reference_signal != endpoint_reference_signal:
+            raise GuidedSetupError(f"connection {index} reference terminal signal_type contradicts reference endpoint")
+        for field in ("max_voltage_v", "max_current_a"):
+            connection_limit = _finite_limit(connection, field, f"connection {index}")
+            source_limit = _finite_limit(source_terminal, field, f"connection {index} source terminal")
+            destination_limit = _finite_limit(destination_data, field, f"connection {index} destination endpoint")
+            reference_terminal_limit = _finite_limit(
+                reference_terminal, field, f"connection {index} reference terminal"
+            )
+            reference_endpoint_limit = _finite_limit(
+                reference_data, field, f"connection {index} reference endpoint"
+            )
+            restrictive_limit = min(
+                source_limit,
+                destination_limit,
+                reference_terminal_limit,
+                reference_endpoint_limit,
+            )
+            if connection_limit > restrictive_limit:
+                raise GuidedSetupError(
+                    f"connection {index} {field} {connection_limit} exceeds the most restrictive canonical "
+                    f"limit {restrictive_limit}"
+                )
+    summary: dict[str, Any] = {
+        "revision": revision,
+        "dut": dict(dut),
+        "connections": [dict(item) for item in connections],
+    }
+    if fixture is not None:
+        summary["fixture"] = dict(fixture)
+    return summary
 
 
 def build_context_pack(
@@ -73,7 +354,11 @@ def build_context_pack(
 
     requirement = _find_requirement(requirements_data, requirement_id)
     bench = _bench_summary(bench_data)
-    schematic = _schematic_summary(schematic_data)
+    instruments = {
+        _required_text(item.get("name"), "bench instrument name"): item
+        for item in bench["instruments"]
+    }
+    schematic = _schematic_summary(schematic_data, instruments=instruments)
     evidence_root = bench.get("evidence_root") or "reports/guided-tests"
     evidence = _list(requirement.get("evidence"))
 
@@ -87,10 +372,13 @@ def build_context_pack(
             "bench": bench.get("safety_controls", []),
             "requirement": _list(requirement.get("safety_controls")),
             "required_before_execution": [
-                "Run lg-safe before wiring changes.",
+                "Run lg-safe with the expected bench/preflight config before wiring changes.",
                 "Confirm schematic-to-harness mapping.",
                 "Confirm preflight passes.",
                 "Confirm operator wiring before energizing outputs.",
+            ],
+            "required_after_execution": [
+                "Run lg-safe with the expected bench/preflight config after every test, including failures."
             ],
         },
         "execution": {
@@ -103,61 +391,41 @@ def build_context_pack(
     return pack
 
 
-def _instrument_names(pack: Mapping[str, Any]) -> set[str]:
-    bench = _mapping(pack.get("bench", {}), "bench")
-    requirement = _mapping(pack.get("requirement", {}), "requirement")
-    names = {str(item.get("name", "")).lower() for item in _list(bench.get("instruments")) if isinstance(item, Mapping)}
-    for item in _list(requirement.get("instrumentation")):
-        text = str(item).lower()
-        if "cell simulator" in text:
-            names.add("cell_simulator")
-        if "logic analyzer" in text:
-            names.add("logic_analyzer")
-        if "daq" in text:
-            names.add("daq")
-        if "can" in text:
-            names.add("can_interface")
-        if "supply" in text or "simulator" in text:
-            names.add("hv_supply")
-    return names
+def _format_endpoint(endpoint: Mapping[str, Any]) -> str:
+    scope = "DUT" if endpoint.get("scope", "dut") == "dut" else "fixture"
+    if endpoint.get("test_point"):
+        return f"{scope} test point {endpoint['test_point']} / net {endpoint['net']}"
+    return f"{scope} {endpoint['connector']} pin {endpoint.get('pin')} / net {endpoint['net']}"
 
 
 def _connection_steps(pack: Mapping[str, Any]) -> list[str]:
-    names = _instrument_names(pack)
     schematic = _mapping(pack.get("schematic", {}), "schematic")
-    dut = _mapping(schematic.get("dut", {}), "schematic.dut")
-    connectors = _mapping(dut.get("connectors", {}), "schematic.dut.connectors") if dut.get("connectors") else {}
-    test_points = _mapping(dut.get("test_points", {}), "schematic.dut.test_points") if dut.get("test_points") else {}
+    revision = str(schematic.get("revision", "")).strip()
+    connections = _list(schematic.get("connections"))
+    if not connections:
+        return ["STOP: No approved explicit connection records were provided; do not infer wiring from net names."]
+
     steps: list[str] = []
-
-    for connector_name, connector in connectors.items():
-        if not isinstance(connector, Mapping):
-            continue
-        pins = connector.get("pins", {})
-        if not isinstance(pins, Mapping):
-            continue
-        for pin, meta in pins.items():
-            if not isinstance(meta, Mapping):
-                continue
-            net = str(meta.get("net", "")).upper()
-            if "FAULT" in net and ("logic_analyzer" in names or "daq" in names):
-                instrument = "logic_analyzer" if "logic_analyzer" in names else "DAQ"
-                steps.append(f"Connect {instrument} to {connector_name} pin {pin} / net {meta.get('net')}.")
-            elif "VIN" in net or "PACK" in net:
-                source = "hv_supply" if "hv_supply" in names else "power_source"
-                steps.append(f"Connect {source} to {connector_name} pin {pin} / net {meta.get('net')}.")
-
-    for tp_name, meta in test_points.items():
-        if not isinstance(meta, Mapping):
-            continue
-        net = str(meta.get("net", "")).upper()
-        if "CELL" in net and "cell_simulator" in names:
-            steps.append(f"Connect cell_simulator to test point {tp_name} / net {meta.get('net')}.")
+    for index, raw_connection in enumerate(connections, start=1):
+        connection = _mapping(raw_connection, f"connection {index}")
+        destination = _mapping(connection.get("destination"), f"connection {index} destination")
+        reference = _mapping(connection.get("reference"), f"connection {index} reference")
+        destination_text = _format_endpoint(destination)
+        reference_text = _format_endpoint(reference)
+        reference_instrument = reference.get("instrument", connection["instrument"])
+        if reference_instrument == connection["instrument"]:
+            reference_source = f"reference {reference['instrument_terminal']}"
         else:
-            steps.append(f"Review schematic mapping for test point {tp_name} / net {meta.get('net')}.")
-
-    if not steps:
-        steps.append("STOP: No deterministic connection steps could be resolved from schematic context.")
+            reference_source = (
+                f"reference {reference_instrument} terminal {reference['instrument_terminal']}"
+            )
+        steps.append(
+            f"Connect {connection['instrument']} terminal {connection['terminal']} to {destination_text}; "
+            f"connect {reference_source} to {reference_text}. "
+            f"Limits: {connection['max_voltage_v']} V, {connection['max_current_a']} A; "
+            f"signal {connection['signal_type']}; isolation {connection['isolation']}; "
+            f"source revision {revision}."
+        )
     return steps
 
 
@@ -186,8 +454,9 @@ def generate_operator_guide(pack: Mapping[str, Any]) -> str:
         "",
         "## Safety Gates",
         "",
-        "- Run `lg-safe` before wiring changes.",
+        "- Run `lg-safe <bench/preflight-config.yaml>` before wiring changes.",
         "- Do not energize outputs until preflight and wiring confirmation pass.",
+        "- MANDATORY FINAL GATE: Run `lg-safe <bench/preflight-config.yaml>` after every test, including failures.",
     ]
     for item in _list(safety.get("bench")) + _list(safety.get("requirement")):
         lines.append(f"- {item}")

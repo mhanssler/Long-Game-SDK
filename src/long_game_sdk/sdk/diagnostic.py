@@ -1,17 +1,18 @@
 import platform
 import sys
+from typing import Any, cast
 
 import pyvisa
 
 def check_environment():
-    print(f"--- Long Game SDK Environment Diagnostic ---")
+    print("--- Long Game SDK Environment Diagnostic ---")
     print(f"OS: {platform.system()} {platform.release()}")
     print(f"Python: {sys.version}")
-    
+
     # Check for library conflicts
     if 'visa' in sys.modules:
         print("WARNING: 'visa' (legacy) module loaded. This may conflict with 'pyvisa'.")
-    
+
     try:
         rm = pyvisa.ResourceManager("@py")
         print(f"PyVISA Backend: {rm.visalib}")
@@ -19,7 +20,7 @@ def check_environment():
         print(f"Detected Resources: {resources}")
         for resource in resources:
             try:
-                instrument = rm.open_resource(resource)
+                instrument = cast(Any, rm.open_resource(resource))
                 instrument.timeout = 3000
                 idn = instrument.query("*IDN?").strip().replace("\x00", "")
                 print(f"  {resource}: {idn}")

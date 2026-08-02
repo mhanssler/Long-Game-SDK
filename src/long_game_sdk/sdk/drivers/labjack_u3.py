@@ -20,6 +20,7 @@ class LabJackDependencyError(RuntimeError):
 @dataclass
 class LabJackU3Driver:
     auto_open: bool = True
+    serial: str | int | None = None
 
     def __post_init__(self) -> None:
         local_exodriver = Path(os.environ.get("LABJACK_EXODRIVER", "~/.local/lib/liblabjackusb.so")).expanduser()
@@ -33,7 +34,12 @@ class LabJackU3Driver:
                 "uv add LabJackPython, and ensure OS USB permissions allow access."
             ) from exc
         self._u3 = u3
-        self.device = u3.U3(autoOpen=self.auto_open)
+        if self.serial is not None:
+            # Never let a safety operation attach to whichever U3 happens to be first.
+            self.device = u3.U3(autoOpen=False)
+            self.device.open(serial=self.serial)
+        else:
+            self.device = u3.U3(autoOpen=self.auto_open)
         try:
             self.device.configU3()
         except Exception:

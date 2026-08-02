@@ -14,6 +14,9 @@ class FakeInstrument:
     def write(self, command: str) -> None:
         self.responses[f"write:{command}"] = "ok"
 
+    def close(self) -> None:
+        return None
+
 
 def test_diagnostic_audit_scores_and_renders_client_summary(tmp_path):
     config = {
@@ -23,7 +26,7 @@ def test_diagnostic_audit_scores_and_renders_client_summary(tmp_path):
             "instruments": [
                 {
                     "name": "main_psu",
-                    "expected_model": "Rigol DP832",
+                    "expected_model": "DP832",
                     "checks": ["identity", "output_disabled_on_start", "calibration_date"],
                     "safety": {"output_query": ":OUTPut? CH1", "calibration_due": "2027-06-01"},
                 }
@@ -55,7 +58,7 @@ def test_diagnostic_audit_flags_blockers_and_penalizes_score(tmp_path):
         "rig": {
             "name": "bench-a",
             "dut_type": "pcba",
-            "instruments": [{"name": "main_psu", "expected_model": "Rigol DP832", "checks": ["identity"]}],
+            "instruments": [{"name": "main_psu", "expected_model": "DP832", "checks": ["identity"]}],
         },
         "runtime": {"output_dir": str(tmp_path)},
     }
@@ -73,4 +76,4 @@ def test_diagnostic_audit_flags_blockers_and_penalizes_score(tmp_path):
     assert audit.health_score < 100
     assert audit.blockers
     assert "REMEDIATION REQUIRED" in markdown
-    assert "expected Rigol DP832" in markdown
+    assert "expected DP832" in markdown

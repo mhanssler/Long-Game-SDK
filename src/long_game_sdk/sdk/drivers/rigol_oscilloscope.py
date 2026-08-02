@@ -24,7 +24,7 @@ class RigolDS1000(Oscilloscope):
     def __init__(self, resource_name: str, *, resource_manager: Optional[Any] = None) -> None:
         self.resource_name = resource_name
         # Implementation would use pyvisa here
-        self._instrument = None 
+        self._instrument = None
 
     def get_waveform(self, channel: int) -> list[float]:
         # Implementation to pull waveform via SCPI

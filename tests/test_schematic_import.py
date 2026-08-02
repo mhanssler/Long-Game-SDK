@@ -115,3 +115,52 @@ def test_context_can_be_serialized_to_yaml(tmp_path: Path) -> None:
 
     assert "schematic_context:" in dumped
     assert "VIN+" in dumped
+
+
+def test_import_rejects_conflicting_duplicate_pin_mapping(tmp_path: Path) -> None:
+    csv_path = tmp_path / "conflict.csv"
+    csv_path.write_text("connector,pin,net\nJ1,1,VIN+\nJ1,1,VIN-\n")
+
+    try:
+        import_pin_map_csv(csv_path)
+    except SchematicImportError as exc:
+        assert "conflicting" in str(exc)
+        assert "J1 pin 1" in str(exc)
+    else:
+        raise AssertionError("expected duplicate conflict to fail")
+
+
+def test_import_rejects_negative_or_nonfinite_ratings(tmp_path: Path) -> None:
+    for value in ("-1", "nan", "inf"):
+        csv_path = tmp_path / f"bad-{value}.csv"
+        csv_path.write_text(f"connector,pin,net,max_voltage_v\nJ1,1,VIN+,{value}\n")
+        try:
+            import_pin_map_csv(csv_path)
+        except SchematicImportError as exc:
+            assert "max_voltage_v" in str(exc)
+        else:
+            raise AssertionError(f"expected {value} rating to fail")
+
+
+def test_import_rejects_empty_extraction(tmp_path: Path) -> None:
+    text_path = tmp_path / "empty.txt"
+    text_path.write_text("no connector or test-point records here\n")
+
+    try:
+        import_text_schematic(text_path)
+    except SchematicImportError as exc:
+        assert "no connector or test-point" in str(exc)
+    else:
+        raise AssertionError("expected empty extraction to fail")
+
+
+def test_import_rejects_input_larger_than_limit(tmp_path: Path) -> None:
+    text_path = tmp_path / "huge.txt"
+    text_path.write_bytes(b"x" * 1_000_001)
+
+    try:
+        import_text_schematic(text_path)
+    except SchematicImportError as exc:
+        assert "input exceeds" in str(exc)
+    else:
+        raise AssertionError("expected oversized input to fail")

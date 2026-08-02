@@ -16,3 +16,4 @@ flash:
       - Confirm bench supply outputs are OFF before connecting SWD.
       - Connect GND, SWDIO, SWCLK, NRST, and VTref/target power sense before flashing.
       - Power DUT from a current-limited supply and run safe-state before flashing in a live bench.
+      - Keep verify requested in reviewed plans; this planner does not run or verify flashing.

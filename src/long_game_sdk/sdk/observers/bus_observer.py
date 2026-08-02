@@ -30,14 +30,14 @@ class InstrumentObserver:
         try:
             current_instruments = set(self.rm.list_resources())
             new_instruments = current_instruments - self.known_instruments
-            
+
             for instrument in new_instruments:
                 logger.info(f"NEW INSTRUMENT DETECTED: {instrument}")
                 self._process_new_instrument(instrument)
                 self.known_instruments.add(instrument)
-            
+
             self._save_state()
-            
+
         except Exception as e:
             logger.error(f"Scan error: {e}")
 

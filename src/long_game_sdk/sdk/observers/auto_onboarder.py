@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import pyvisa
 
@@ -39,9 +39,9 @@ class AutoOnboarder:
             logger.error("Scan error: %s", exc)
 
     def identify(self, instrument_id: str) -> InstrumentIdentity:
-        instrument = None
+        instrument: Any | None = None
         try:
-            instrument = self.rm.open_resource(instrument_id)
+            instrument = cast(Any, self.rm.open_resource(instrument_id))
             try:
                 instrument.timeout = 3000
             except Exception:

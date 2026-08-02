@@ -30,7 +30,7 @@ from typing import Any, Iterable
 import yaml
 
 from long_game_sdk.sdk.discovery import InstrumentIdentity, discover_all
-from long_game_sdk.sdk.registry import PROJECT_ROOT, ensure_schema, infer_capability_profile, match_driver
+from long_game_sdk.sdk.registry import PROJECT_ROOT, ensure_schema, infer_capability_profile
 
 MANUALS_DIR = PROJECT_ROOT / "manuals"
 MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024

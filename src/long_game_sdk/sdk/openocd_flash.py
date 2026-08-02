@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 import yaml
 
 
+_ALLOWED_TRANSPORTS = frozenset(
+    {"swd", "jtag", "hla_swd", "hla_jtag", "dapdirect_swd", "dapdirect_jtag"}
+)
+_ALLOWED_FORMATS = frozenset({"elf", "bin", "hex", "s19"})
+_CONFIG_PATH_RE = re.compile(r"^[A-Za-z0-9_.+-]+(?:/[A-Za-z0-9_.+-]+)*\.cfg$")
+EXECUTION_UNAVAILABLE_MESSAGE = "OpenOCD execution unavailable pending hardened sandbox"
+
+
 class FlashConfigError(ValueError):
-    """Raised when an OpenOCD flash config is incomplete or unsafe."""
+    """Raised when an OpenOCD flash plan is incomplete or unsafe."""
+
+
+class ExecutionUnavailableError(FlashConfigError):
+    """Raised for every request to execute OpenOCD in this release."""
 
 
 @dataclass(frozen=True)
@@ -32,10 +44,6 @@ class FlashConfig:
     verify: bool = True
     reset: bool = True
     adapter_speed_khz: int | None = None
-    openocd_bin: str = "openocd"
-    extra_cfg: tuple[str, ...] = ()
-    pre_commands: tuple[str, ...] = ()
-    post_commands: tuple[str, ...] = ()
     safety: FlashSafety = field(default_factory=FlashSafety)
 
 
@@ -46,6 +54,11 @@ class FlashResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    error_kind: str | None = None
+
+
+def _execution_unavailable() -> NoReturn:
+    raise ExecutionUnavailableError(EXECUTION_UNAVAILABLE_MESSAGE)
 
 
 def _require_mapping(data: Any, label: str) -> Mapping[str, Any]:
@@ -71,8 +84,24 @@ def _require_string(data: Mapping[str, Any], field_name: str) -> str:
     return value.strip()
 
 
+def _validated_config_path(value: str, *, prefix: str, field_name: str) -> str:
+    has_traversal = any(part in {".", ".."} for part in value.split("/"))
+    if has_traversal or not value.startswith(f"{prefix}/") or not _CONFIG_PATH_RE.fullmatch(value):
+        raise FlashConfigError(
+            f"flash.openocd.{field_name} must be a relative {prefix}/*.cfg path"
+        )
+    return value
+
+
+def _optional_boolean(data: Mapping[str, Any], field_name: str, default: bool) -> bool:
+    value = data.get(field_name, default)
+    if not isinstance(value, bool):
+        raise FlashConfigError(f"flash.{field_name} must be a boolean")
+    return value
+
+
 def load_flash_config(path: str | Path) -> FlashConfig:
-    """Load and validate an OpenOCD flash YAML config."""
+    """Load and validate an OpenOCD dry-run plan config."""
     config_path = Path(path)
     try:
         data = yaml.safe_load(config_path.read_text())
@@ -84,6 +113,11 @@ def load_flash_config(path: str | Path) -> FlashConfig:
     root = _require_mapping(data, "config")
     flash = _require_mapping(root.get("flash"), "flash")
     openocd = _require_mapping(flash.get("openocd"), "flash.openocd")
+    for unsupported_field in ("bin", "extra_cfg", "pre_commands", "post_commands"):
+        if unsupported_field in openocd:
+            raise FlashConfigError(
+                f"flash.openocd.{unsupported_field} is not allowed; the planner emits a fixed command shape"
+            )
     safety_data = _require_mapping(flash.get("safety", {}), "flash.safety")
 
     firmware = Path(_require_string(flash, "firmware"))
@@ -101,30 +135,62 @@ def load_flash_config(path: str | Path) -> FlashConfig:
         if adapter_speed <= 0:
             raise FlashConfigError("flash.adapter_speed_khz must be positive")
 
+    transport_value = flash.get("transport")
+    transport = str(transport_value).strip() if transport_value else None
+    if transport is not None and transport not in _ALLOWED_TRANSPORTS:
+        raise FlashConfigError(
+            f"flash.transport must be one of: {', '.join(sorted(_ALLOWED_TRANSPORTS))}"
+        )
+
+    image_format = str(flash.get("format", "elf")).strip() or "elf"
+    if image_format not in _ALLOWED_FORMATS:
+        raise FlashConfigError(
+            f"flash.format must be one of: {', '.join(sorted(_ALLOWED_FORMATS))}"
+        )
+
     return FlashConfig(
         target=_require_string(flash, "target"),
         interface=_require_string(flash, "interface"),
         firmware=firmware,
-        interface_cfg=_require_string(openocd, "interface_cfg"),
-        target_cfg=_require_string(openocd, "target_cfg"),
-        transport=str(flash.get("transport")).strip() if flash.get("transport") else None,
-        format=str(flash.get("format", "elf")).strip() or "elf",
-        verify=bool(flash.get("verify", True)),
-        reset=bool(flash.get("reset", True)),
+        interface_cfg=_validated_config_path(
+            _require_string(openocd, "interface_cfg"),
+            prefix="interface",
+            field_name="interface_cfg",
+        ),
+        target_cfg=_validated_config_path(
+            _require_string(openocd, "target_cfg"),
+            prefix="target",
+            field_name="target_cfg",
+        ),
+        transport=transport,
+        format=image_format,
+        verify=_optional_boolean(flash, "verify", True),
+        reset=_optional_boolean(flash, "reset", True),
         adapter_speed_khz=adapter_speed,
-        openocd_bin=str(openocd.get("bin", "openocd")).strip() or "openocd",
-        extra_cfg=_as_tuple(openocd.get("extra_cfg")),
-        pre_commands=_as_tuple(openocd.get("pre_commands")),
-        post_commands=_as_tuple(openocd.get("post_commands")),
         safety=FlashSafety(
-            require_unpowered_outputs=bool(safety_data.get("require_unpowered_outputs", True)),
+            require_unpowered_outputs=_optional_boolean(
+                safety_data, "require_unpowered_outputs", True
+            ),
             notes=_as_tuple(safety_data.get("notes")),
         ),
     )
 
 
+def _tcl_quote(value: str) -> str:
+    """Return one literal Tcl word, disabling command and variable substitution."""
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        raise FlashConfigError("firmware path contains a forbidden control character")
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("[", "\\[")
+    )
+    return f'"{escaped}"'
+
+
 def _program_command(config: FlashConfig) -> str:
-    parts = ["program", config.firmware.as_posix()]
+    parts = ["program", _tcl_quote(config.firmware.as_posix())]
     if config.verify:
         parts.append("verify")
     if config.reset:
@@ -140,118 +206,102 @@ def _openocd_commands(config: FlashConfig) -> list[str]:
         commands.append(f"transport select {config.transport}")
     if config.adapter_speed_khz:
         commands.append(f"adapter speed {config.adapter_speed_khz}")
-    commands.extend(config.pre_commands)
-    commands.extend(["init", "reset halt", _program_command(config)])
-    commands.extend(config.post_commands)
-    commands.append("shutdown")
+    commands.extend(["init", "reset halt", _program_command(config), "shutdown"])
     return commands
 
 
 def build_openocd_command(config: FlashConfig) -> list[str]:
-    """Build the OpenOCD command for a flash config without executing it."""
-    command = [
-        config.openocd_bin,
+    """Build an illustrative OpenOCD command without executing it."""
+    if config.transport is not None and config.transport not in _ALLOWED_TRANSPORTS:
+        raise FlashConfigError("transport is not allowlisted")
+    if config.format not in _ALLOWED_FORMATS:
+        raise FlashConfigError("format is not allowlisted")
+    _validated_config_path(config.interface_cfg, prefix="interface", field_name="interface_cfg")
+    _validated_config_path(config.target_cfg, prefix="target", field_name="target_cfg")
+    if config.adapter_speed_khz is not None and (
+        isinstance(config.adapter_speed_khz, bool) or config.adapter_speed_khz <= 0
+    ):
+        raise FlashConfigError("adapter speed must be a positive integer")
+    return [
+        "openocd",
         "-f",
         config.interface_cfg,
         "-f",
         config.target_cfg,
+        "-c",
+        "; ".join(_openocd_commands(config)),
     ]
-    for cfg in config.extra_cfg:
-        command.extend(["-f", cfg])
-    command.extend(["-c", "; ".join(_openocd_commands(config))])
-    return command
 
 
-def _subprocess_runner(command: list[str]) -> FlashResult:
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    return FlashResult(
-        command=command,
-        executed=True,
-        returncode=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-    )
+def authorize_flash(*args: Any, **kwargs: Any) -> NoReturn:
+    """Compatibility fail-closed gate; live authorization is not available."""
+    _execution_unavailable()
+
+
+def create_safe_state_attestation(*args: Any, **kwargs: Any) -> NoReturn:
+    """Compatibility fail-closed gate; execution attestations are not accepted."""
+    _execution_unavailable()
 
 
 def flash_firmware(
     config: FlashConfig,
     *,
     execute: bool = False,
-    runner: Callable[[list[str]], FlashResult | None] = _subprocess_runner,
+    authorization: object | None = None,
+    timeout_seconds: float | None = None,
 ) -> FlashResult:
-    """Plan or execute firmware flashing through OpenOCD.
-
-    Dry-run is the default because flashing changes DUT state. Callers must pass
-    execute=True only after wiring and target identity have been confirmed.
-    """
-    command = build_openocd_command(config)
-    if not execute:
-        return FlashResult(command=command, executed=False, returncode=0)
-    result = runner(command)
-    if result is None:
-        return FlashResult(command=command, executed=True, returncode=0)
-    return result
+    """Generate an OpenOCD plan; reject every live-execution request before side effects."""
+    if execute:
+        _execution_unavailable()
+    return FlashResult(command=build_openocd_command(config), executed=False, returncode=0)
 
 
 def generate_flash_plan(config: FlashConfig, result: FlashResult) -> str:
-    mode = "execute" if result.executed else "dry-run"
     safety_notes = list(config.safety.notes) or ["No extra safety notes provided."]
     lines = [
         "# OpenOCD Flash Plan",
         "",
-        f"- Mode: {mode}",
-        f"- Target: {config.target}",
-        f"- Interface: {config.interface}",
+        "- Mode: dry-run only (not executed)",
+        "- Status: planning output only; no hardware or image verification was performed",
+        f"- Target config label (not identity-verified): {config.target}",
+        f"- Interface label: {config.interface}",
         f"- Transport: {config.transport or 'OpenOCD default'}",
         f"- Firmware: {config.firmware.as_posix()}",
-        f"- Verify after program: {'yes' if config.verify else 'no'}",
-        f"- Reset after program: {'yes' if config.reset else 'no'}",
-        f"- Require unpowered bench outputs before connect: {'yes' if config.safety.require_unpowered_outputs else 'no'}",
+        f"- Image format: {config.format}",
+        f"- Verify requested in proposed command: {'yes' if config.verify else 'no'}",
+        f"- Reset requested in proposed command: {'yes' if config.reset else 'no'}",
+        f"- Plan calls for unpowered bench outputs before connect: {'yes' if config.safety.require_unpowered_outputs else 'no'}",
         "",
         "## Safety Notes",
         "",
         *[f"- {note}" for note in safety_notes],
         "",
-        "## OpenOCD Command",
+        "## Proposed OpenOCD Command (not executed)",
         "",
         "```bash",
         shlex.join(result.command),
         "```",
     ]
-    if result.executed:
-        lines.extend(
-            [
-                "",
-                "## Result",
-                "",
-                f"- Return code: {result.returncode}",
-                "",
-                "### stdout",
-                "",
-                "```text",
-                result.stdout.strip(),
-                "```",
-                "",
-                "### stderr",
-                "",
-                "```text",
-                result.stderr.strip(),
-                "```",
-            ]
-        )
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Plan or execute firmware flashing with OpenOCD")
-    parser.add_argument("config", help="OpenOCD flash YAML config")
-    parser.add_argument("-o", "--output", help="Write flash plan/result markdown to this path")
-    parser.add_argument("--execute", action="store_true", help="Actually run OpenOCD. Default is dry-run")
+    parser = argparse.ArgumentParser(description="Generate a dry-run OpenOCD flash plan")
+    parser.add_argument("config", help="OpenOCD flash-plan YAML config")
+    parser.add_argument("-o", "--output", help="Write flash-plan markdown to this path")
     parser.add_argument(
-        "--yes-i-confirm-target-wiring",
+        "--execute",
         action="store_true",
-        help="Required with --execute to confirm target power/wiring/debug header are correct",
+        help="Unavailable: live execution is disabled pending a hardened sandbox",
     )
+    # Retain old flags only so stale execution commands fail with the explicit
+    # unavailable message rather than being mistaken for a parser problem.
+    parser.add_argument("--timeout-seconds", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--trusted-config-root", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--openocd-executable", help=argparse.SUPPRESS)
+    parser.add_argument("--safe-state-config", help=argparse.SUPPRESS)
+    parser.add_argument("--unsafe-allow-unverified", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--yes-i-confirm-target-wiring", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -261,21 +311,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
-    if args.execute and not args.yes_i_confirm_target_wiring:
-        print("--execute requires --yes-i-confirm-target-wiring", flush=True)
+    if args.execute:
         import sys
 
-        print("Refusing to flash until target wiring and power state are explicitly confirmed.", file=sys.stderr)
-        print("Use --yes-i-confirm-target-wiring after verifying SWD/JTAG, reset, ground, and target power.", file=sys.stderr)
+        print(EXECUTION_UNAVAILABLE_MESSAGE, file=sys.stderr)
         return 2
 
     try:
         config = load_flash_config(args.config)
-        result = flash_firmware(config, execute=bool(args.execute))
+        result = flash_firmware(config)
     except FlashConfigError as exc:
         import sys
 
-        print(f"flash config error: {exc}", file=sys.stderr)
+        print(f"flash plan error: {exc}", file=sys.stderr)
         return 2
 
     plan = generate_flash_plan(config, result)
@@ -285,7 +333,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         output_path.write_text(plan)
     else:
         print(plan, end="")
-    return result.returncode
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -3,7 +3,9 @@ rig:
   dut_type: pcba
   instruments:
     - name: main_psu
-      expected_model: Rigol DP832
+      expected_manufacturer: RIGOL TECHNOLOGIES
+      expected_model: DP832
+      expected_serial: DP8C000000000
       connection: USB0::0x1AB1::0x0E11::DP8C000000000::INSTR
       checks:
         - identity
@@ -13,11 +15,30 @@ rig:
         - current_limit
       safety:
         calibration_due: 2027-06-01
-        output_query: ":OUTPut? CH1"
-        voltage_limit: "CH1 <= 5.50 V, CH2 <= 15.0 V, CH3 <= 15.0 V"
-        current_limit: "CH1 <= 1.0 A, CH2 <= 0.5 A, CH3 <= 0.5 A"
+        energy_source: true
+        channels:
+          - channel: CH1
+            output_query: ":OUTPut? CH1"
+            voltage_limit: {value: 5.5, unit: V}
+            voltage_query: ":SOURce1:VOLTage?"
+            current_limit: {value: 1.0, unit: A}
+            current_query: ":SOURce1:CURRent?"
+          - channel: CH2
+            output_query: ":OUTPut? CH2"
+            voltage_limit: {value: 5.5, unit: V}
+            voltage_query: ":SOURce2:VOLTage?"
+            current_limit: {value: 1.0, unit: A}
+            current_query: ":SOURce2:CURRent?"
+          - channel: CH3
+            output_query: ":OUTPut? CH3"
+            voltage_limit: {value: 5.5, unit: V}
+            voltage_query: ":SOURce3:VOLTage?"
+            current_limit: {value: 1.0, unit: A}
+            current_query: ":SOURce3:CURRent?"
     - name: scope
-      expected_model: Rigol DS1102E
+      expected_manufacturer: RIGOL TECHNOLOGIES
+      expected_model: DS1102E
+      expected_serial: DS1ZA000000000
       connection: USB0::0x1AB1::0x0588::DS1ZA000000000::INSTR
       checks:
         - identity

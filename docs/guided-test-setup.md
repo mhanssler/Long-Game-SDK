@@ -7,9 +7,10 @@ It combines:
 - requirement/test intent
 - bench instruments/connectors/safety controls
 - schematic context: DUT connectors, pins, nets, test points
+- approved, revision-controlled connection records with terminals, references, electrical limits, signal type, and isolation
 - evidence expectations
 - optional pytest target
-- optional firmware flash config
+- optional firmware flash-plan config (dry-run context only)
 
 The command emits two artifacts:
 
@@ -30,17 +31,17 @@ uv run lg-guide-test examples/hil_bms_requirements.yaml \
 
 ## Safety model
 
-This MVP is **guide-only**. `--execute` is intentionally refused for now.
+This MVP is **guide-only**. `--execute` is intentionally refused for now. Any included OpenOCD data is planning context only; OpenOCD execution is unavailable pending a hardened sandbox.
 
-The generated guide tells the operator what can be determined from structured inputs, but execution still requires later gates:
+The generated guide tells the operator what can be determined from structured inputs. It does not authorize or perform flashing or tests. Before any separately implemented future hardware workflow, an operator would still need independent gates such as:
 
-1. `lg-safe` before wiring changes
+1. `lg-safe <bench/preflight-config.yaml>` before wiring changes
 2. schematic-to-harness review
 3. preflight pass
 4. explicit wiring confirmation
-5. safe-state after flashing/tests
+5. safe-state after any separately operated flashing/tests
 
-The LLM may explain the guide, but the SDK owns execution gating.
+The LLM and SDK produce guide material only; neither proves that later hardware execution is safe or successful.
 
 ## Product chain
 
@@ -48,21 +49,25 @@ The LLM may explain the guide, but the SDK owns execution gating.
 requirements
 → schematic context
 → bench config
-→ driver/flash/test capabilities
+→ driver/flash-plan/test context
 → deterministic context pack
 → LLM/operator guide
-→ gated execution
-→ evidence
+→ operator review
+→ future workflow outside this guide-only feature
 ```
 
 The important design rule is that the LLM receives complete context instead of searching the repo or guessing wiring. If the context pack cannot resolve a required net/pin/test point, guided setup should stop and ask for the missing mapping.
 
-## Current deterministic connection inference
+## Explicit connection records
 
-The MVP resolves obvious setup steps from schematic nets and available bench instruments:
+`lg-guide-test` never derives actionable wiring from net-name substrings such as `VIN`, `PACK`, `FAULT`, or `CELL`. The schematic context must provide a `revision` plus approved `connections`. Each record must include:
 
-- `FAULT` nets → logic analyzer or DAQ
-- `CELL` test points → cell simulator
-- `VIN` / `PACK` nets → power source / HV supply
+- instrument and terminal
+- destination connector/pin or test point and net
+- instrument reference/return terminal and complete connector/pin or test-point endpoint and net
+- signal type and isolation model
+- finite voltage/current limits
+- `approved: true`
+- `source_revision` matching `schematic_context.revision`
 
-This is intentionally conservative. It is enough to generate a useful first operator guide while keeping ambiguity visible.
+Missing records produce a `STOP` instruction. Unapproved, incomplete, non-finite, or revision-mismatched records reject context-pack generation. Instrument names must exist in bench inventory. Every DUT/fixture connector, pin, test point, and net is checked against its canonical schematic mapping; missing mappings and contradictions stop before an operator guide can render actionable wiring. Rendered endpoints always include `DUT` or `fixture` scope so identically named connectors such as `J1` cannot be confused.
