@@ -187,6 +187,62 @@ def test_bounded_write_allowed_only_inside_armed_context(tmp_path: Path) -> None
     assert instrument.writes == [":SOURce1:VOLTage 3.300"]
 
 
+def test_armed_write_rechecks_identity_instead_of_using_cached_verification(tmp_path: Path) -> None:
+    instrument = FakeInstrument()
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+    driver = UniversalDriver(
+        "mock", str(path), instrument=instrument, trusted_schema=True, expected_identity=bound_identity()
+    )
+
+    with driver.armed():
+        instrument.idn = "ACME,SAFE-1,REPLACED,1.0"
+        with pytest.raises(MutationSafetyError, match="identity"):
+            driver.set_voltage(channel=1, value=3.3)
+
+    assert instrument.queries == ["*IDN?", "*IDN?"]
+    assert instrument.writes == []
+
+
+def test_armed_write_rejects_replaced_instrument_object(tmp_path: Path) -> None:
+    original = FakeInstrument()
+    replacement = FakeInstrument()
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+    driver = UniversalDriver(
+        "mock", str(path), instrument=original, trusted_schema=True, expected_identity=bound_identity()
+    )
+
+    with driver.armed():
+        driver.instrument = replacement
+        with pytest.raises(MutationSafetyError, match="instrument.*changed|identity"):
+            driver.set_voltage(channel=1, value=3.3)
+
+    assert replacement.writes == []
+
+
+def test_armed_write_rejects_instrument_swap_during_identity_recheck(tmp_path: Path) -> None:
+    original = FakeInstrument()
+    replacement = FakeInstrument()
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+    driver = UniversalDriver(
+        "mock", str(path), instrument=original, trusted_schema=True, expected_identity=bound_identity()
+    )
+    original_query = original.query
+
+    def swapping_query(command: str) -> str:
+        response = original_query(command)
+        if command == "*IDN?":
+            driver.instrument = replacement
+        return response
+
+    original.query = swapping_query  # type: ignore[method-assign]
+
+    with driver.armed(), pytest.raises(MutationSafetyError, match="instrument.*changed|identity"):
+        driver.set_voltage(channel=1, value=3.3)
+
+    assert original.writes == []
+    assert replacement.writes == []
+
+
 def test_bounded_write_accepts_compact_bounds_metadata(tmp_path: Path) -> None:
     command = {
         "command": ":SOURce{channel}:VOLTage {value}",

@@ -42,6 +42,22 @@ def _list(value: Any) -> list[Any]:
     return list(value) if isinstance(value, list) else []
 
 
+def _reject_ambiguous_canonical_names(
+    mapping: Mapping[Any, Any], namespace: str, label: str
+) -> None:
+    seen: dict[str, str] = {}
+    for raw_name in mapping:
+        if not isinstance(raw_name, str):
+            continue
+        normalized = raw_name.strip().casefold()
+        previous = seen.get(normalized)
+        if previous is not None and previous != raw_name:
+            raise GuidedSetupError(
+                f"ambiguous canonical {namespace} names in {label}: {previous!r} and {raw_name!r}"
+            )
+        seen[normalized] = raw_name
+
+
 def _find_requirement(requirements_data: Mapping[str, Any], requirement_id: str) -> Mapping[str, Any]:
     for requirement in _list(requirements_data.get("requirements")):
         if isinstance(requirement, Mapping) and str(requirement.get("id")) == requirement_id:
@@ -66,6 +82,7 @@ def _bench_summary(bench_data: Mapping[str, Any]) -> dict[str, Any]:
         terminals = instrument.get("terminals", {})
         if not isinstance(terminals, Mapping):
             raise GuidedSetupError(f"bench instrument {name!r} terminals must be a mapping")
+        _reject_ambiguous_canonical_names(terminals, "terminal", f"bench instrument {name!r}")
         instruments.append(dict(instrument))
     return {
         "name": bench.get("name", "unnamed_bench"),
@@ -134,14 +151,17 @@ def _validate_endpoint(
 
 def _finite_limit(mapping: Mapping[str, Any], field: str, label: str) -> float:
     value = mapping.get(field)
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value < 0
-    ):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise GuidedSetupError(f"{label} requires finite non-negative numeric {field}")
-    return float(value)
+    try:
+        finite_value = float(value)
+    except (OverflowError, ValueError):
+        raise GuidedSetupError(
+            f"{label} requires finite non-negative numeric {field}"
+        ) from None
+    if not math.isfinite(finite_value) or finite_value < 0:
+        raise GuidedSetupError(f"{label} requires finite non-negative numeric {field}")
+    return finite_value
 
 
 def _canonical_terminal(instrument: Mapping[str, Any], terminal_name: str, label: str) -> Mapping[str, Any]:
@@ -159,6 +179,32 @@ def _endpoint_key(endpoint: Mapping[str, Any]) -> tuple[str, str, str]:
     return scope, str(endpoint.get("connector", "")).casefold(), str(endpoint.get("pin", "")).casefold()
 
 
+def _validate_canonical_endpoint_names(canonical: Mapping[str, Any], scope: str) -> None:
+    connectors = _mapping(
+        canonical.get("connectors", {}), f"schematic_context.{scope}.connectors"
+    )
+    _reject_ambiguous_canonical_names(
+        connectors, "connector", f"schematic_context.{scope}.connectors"
+    )
+    for connector_name, raw_connector in connectors.items():
+        connector = _mapping(
+            raw_connector, f"schematic_context.{scope}.connector {connector_name!r}"
+        )
+        pins = _mapping(
+            connector.get("pins", {}),
+            f"schematic_context.{scope}.connector {connector_name!r} pins",
+        )
+        _reject_ambiguous_canonical_names(
+            pins, "pin", f"schematic_context.{scope}.connector {connector_name!r} pins"
+        )
+    test_points = _mapping(
+        canonical.get("test_points", {}), f"schematic_context.{scope}.test_points"
+    )
+    _reject_ambiguous_canonical_names(
+        test_points, "test_point", f"schematic_context.{scope}.test_points"
+    )
+
+
 def _schematic_summary(
     schematic_data: Mapping[str, Any], *, instruments: Mapping[str, Mapping[str, Any]]
 ) -> Mapping[str, Any]:
@@ -168,8 +214,14 @@ def _schematic_summary(
     fixture = _mapping(fixture_raw, "schematic_context.fixture") if fixture_raw is not None else None
     if not dut.get("connectors") and not dut.get("test_points"):
         raise GuidedSetupError("schematic context must include connectors or test_points")
+    _validate_canonical_endpoint_names(dut, "dut")
+    if fixture is not None:
+        _validate_canonical_endpoint_names(fixture, "fixture")
     revision = str(context.get("revision", "")).strip()
-    connections = _list(context.get("connections"))
+    raw_connections = context.get("connections")
+    if "connections" in context and not isinstance(raw_connections, list):
+        raise GuidedSetupError("schematic_context connections must be a list")
+    connections = _list(raw_connections)
     source_terminals: set[tuple[str, str]] = set()
     reference_terminals: set[tuple[str, str]] = set()
     destination_endpoints: set[tuple[str, str, str]] = set()
@@ -207,6 +259,10 @@ def _schematic_summary(
         if reference_instrument is None:
             raise GuidedSetupError(
                 f"connection {index} reference instrument {reference_instrument_name!r} is not in bench inventory"
+            )
+        if not isinstance(reference_instrument.get("energizing"), bool):
+            raise GuidedSetupError(
+                f"bench instrument {reference_instrument_name!r} requires explicit boolean energizing classification"
             )
         destination = _mapping(connection.get("destination"), f"connection {index} destination")
         reference = _mapping(connection.get("reference"), f"connection {index} reference")

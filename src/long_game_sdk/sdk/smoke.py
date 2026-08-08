@@ -1,12 +1,16 @@
-"""Safe hardware smoke tests for discovered instruments.
+"""Fail-closed hardware smoke tests for expected instruments.
 
-`lg-smoke` proves that newly discovered equipment is reachable and classed
-without performing hazardous output-enabling actions. It wraps execution in
-safe-state calls so live bench tests start and end de-energized.
+`lg-smoke CONFIG` accepts an exact expected-equipment inventory, positively
+verifies the whole discovered bench is safe, performs read-only probes, and
+positively verifies safe state again. A missing inventory or any unsafe or
+unverifiable result prevents probes.
 """
 
 from __future__ import annotations
 
+import argparse
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -17,7 +21,7 @@ import yaml
 from long_game_sdk.sdk.discovery import InstrumentIdentity, discover_all
 from long_game_sdk.sdk.drivers.labjack_u3 import LabJackDependencyError, LabJackU3Driver
 from long_game_sdk.sdk.registry import ensure_schema, match_driver
-from long_game_sdk.sdk.safety import apply_safe_state, apply_usb_safe_state
+from long_game_sdk.sdk.safety import SafeStateResult, apply_safe_state, apply_usb_safe_state
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,52 @@ class SmokeResult:
     errors: tuple[str, ...]
 
 
+class SmokeSafetyError(RuntimeError):
+    """Raised when a smoke run cannot prove its initial or final safe state."""
+
+
+_READ_ONLY_SCPI_QUERY = re.compile(
+    r"^(?:\*[A-Za-z][A-Za-z0-9]*|:[A-Za-z][A-Za-z0-9]*(?::[A-Za-z][A-Za-z0-9]*)*)\?"
+    r"(?:\s+[A-Za-z0-9_.+\-]+(?:\s*,\s*[A-Za-z0-9_.+\-]+)*)?$"
+)
+
+
+def _is_read_only_scpi_query(value: Any) -> bool:
+    """Accept one syntactically read-only SCPI query and no compound commands."""
+
+    if not isinstance(value, str):
+        return False
+    query = value.strip()
+    return (
+        query.count("?") == 1
+        and not any(separator in query for separator in (";", "\n", "\r"))
+        and _READ_ONLY_SCPI_QUERY.fullmatch(query) is not None
+    )
+
+
+def _verify_safe_state(config: Mapping[str, Any] | None, phase: str) -> None:
+    """Attempt both safety transports and reject anything not positively safe."""
+
+    results: list[SafeStateResult] = []
+    failures: list[str] = []
+    for label, operation in (("VISA", apply_safe_state), ("USB", apply_usb_safe_state)):
+        try:
+            results.extend(operation(config=config))
+        except Exception as exc:  # noqa: BLE001 - attempt the other transport too
+            failures.append(f"{label}: {exc}")
+
+    if config is None:
+        failures.append("an expected-equipment config is required")
+    failures.extend(
+        f"{item.resource}: {item.state}"
+        + (f" ({'; '.join(item.errors)})" if item.errors else "")
+        for item in results
+        if not item.safe
+    )
+    if failures:
+        raise SmokeSafetyError(f"{phase} safe-state verification failed: " + "; ".join(failures))
+
+
 def _load_schema(path: Path | None) -> dict[str, Any]:
     if path is None or not path.exists():
         return {}
@@ -41,12 +91,12 @@ def _safe_queries(schema: dict[str, Any]) -> list[str]:
     queries: list[str] = []
     safety = schema.get("safety", {}) if isinstance(schema, dict) else {}
     for query in safety.get("verification", []) or []:
-        if isinstance(query, str) and "?" in query:
-            queries.append(query)
+        if _is_read_only_scpi_query(query):
+            queries.append(query.strip())
     for capability in (schema.get("capabilities", {}) or {}).values():
         commands = capability.get("commands", {}) if isinstance(capability, dict) else {}
         for name, command in commands.items():
-            if not isinstance(command, str) or "?" not in command:
+            if not _is_read_only_scpi_query(command):
                 continue
             # Skip parameterized queries in smoke; they need user/test context.
             if "{" in command or "}" in command:
@@ -83,6 +133,10 @@ def _smoke_visa(identity: InstrumentIdentity, schema_path: Path | None) -> Smoke
                 instrument.close()
             except Exception:
                 pass
+        try:
+            rm.close()
+        except Exception:
+            pass
     return SmokeResult(identity.resource, identity.model, match.instrument_class, match.driver_kind, str(schema_path or ""), tuple(checks), tuple(errors))
 
 
@@ -93,7 +147,9 @@ def _smoke_usb(identity: InstrumentIdentity, schema_path: Path | None) -> SmokeR
     if (identity.vendor_id, identity.product_id) == ("0cd5", "0003"):
         driver = None
         try:
-            driver = LabJackU3Driver()
+            if not identity.serial or identity.serial.upper() == "UNKNOWN":
+                raise RuntimeError("LabJack serial is unavailable; refusing to open an unbound device")
+            driver = LabJackU3Driver(serial=identity.serial)
             checks.append(("AIN0", f"{driver.read_ain(0):.6f}"))
             checks.append(("AIN1", f"{driver.read_ain(1):.6f}"))
         except LabJackDependencyError as exc:
@@ -111,14 +167,18 @@ def _smoke_usb(identity: InstrumentIdentity, schema_path: Path | None) -> SmokeR
     return SmokeResult(identity.resource, identity.model, match.instrument_class, match.driver_kind, str(schema_path or ""), tuple(checks), tuple(errors))
 
 
-def run_smoke() -> list[SmokeResult]:
-    """Run safe-state, safe probes, then safe-state again."""
+def run_smoke(config: Mapping[str, Any] | None = None) -> list[SmokeResult]:
+    """Probe only between two positively verified safe-state operations.
 
-    # Start safe before touching hardware. Unknown gear only gets read-only probes.
-    apply_safe_state()
-    apply_usb_safe_state()
+    ``config`` is optional at the Python-call level for compatibility, but a
+    no-config invocation always fails closed after read-only safety discovery.
+    """
+
     results: list[SmokeResult] = []
     try:
+        # This gate prevents discovery/probes unless every result is positively
+        # safe or explicitly validated as non-energizing.
+        _verify_safe_state(config, "initial")
         for identity in discover_all():
             schema_path = ensure_schema(identity)
             if identity.transport == "visa":
@@ -126,15 +186,40 @@ def run_smoke() -> list[SmokeResult]:
             else:
                 results.append(_smoke_usb(identity, schema_path))
     finally:
-        # End safe even if a probe fails.
-        apply_safe_state()
-        apply_usb_safe_state()
+        # Outermost cleanup covers gate, discovery, and probe failures. The
+        # helper attempts both transports before it can fail.
+        _verify_safe_state(config, "final")
     return results
 
 
-def main() -> None:
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run read-only hardware probes between verified safe states"
+    )
+    parser.add_argument(
+        "config",
+        help="Bench/preflight YAML with rig.instruments exact expected-equipment inventory",
+    )
+    try:
+        args = parser.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
+    try:
+        loaded = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+        if not isinstance(loaded, Mapping):
+            raise ValueError("config must be a mapping")
+        config = cast(Mapping[str, Any], loaded)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        print(f"smoke config error: {exc}")
+        return 2
+
     print("--- Long Game SDK Hardware Smoke ---")
-    for result in run_smoke():
+    try:
+        results = run_smoke(config)
+    except SmokeSafetyError as exc:
+        print(f"smoke safety error: {exc}")
+        return 2
+    for result in results:
         print(f"\n{result.resource}")
         print(f"  model:  {result.model}")
         print(f"  class:  {result.instrument_class}")
@@ -148,7 +233,8 @@ def main() -> None:
             print("  errors:")
             for error in result.errors:
                 print(f"    {error}")
+    return 1 if any(result.errors for result in results) else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

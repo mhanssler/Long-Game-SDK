@@ -109,6 +109,56 @@ def _expected_identity_fields(expected: Mapping[str, Any]) -> tuple[str, str, st
     return parsed_expected
 
 
+def _validate_identity_declarations(
+    label: str, *declarations: Mapping[str, Any]
+) -> None:
+    """Require every exact-identity alias for one binding to agree."""
+    values: dict[str, set[str]] = {
+        "manufacturer": set(),
+        "model": set(),
+        "serial": set(),
+    }
+    for declaration in declarations:
+        for field in values:
+            for key in (f"expected_{field}", field):
+                value = str(declaration.get(key) or "").strip()
+                if value:
+                    values[field].add(value.casefold())
+        for key in ("expected_identity", "expected_idn"):
+            identity = str(declaration.get(key) or "").strip()
+            if not identity:
+                continue
+            parsed = _parse_idn(identity)
+            if parsed is None:
+                raise SafeStateConfigError(f"{label} has malformed exact expected identity")
+            for field, value in zip(values, parsed):
+                values[field].add(value.casefold())
+    for field, declared_values in values.items():
+        if len(declared_values) > 1:
+            raise SafeStateConfigError(
+                f"{label} has conflicting exact expected {field} identity declarations"
+            )
+
+
+def _validate_energy_classification(
+    label: str, *declarations: Mapping[str, Any]
+) -> None:
+    """Reject declarations that classify one instrument as both energy and non-energy."""
+    energy_values = [
+        declaration[key]
+        for declaration in declarations
+        for key in ("energy_source", "is_energy_source")
+        if key in declaration
+    ]
+    declares_energy = any(value is True for value in energy_values)
+    declares_non_energy = (
+        any(value is False for value in energy_values)
+        or any(declaration.get("validated_non_energy") is True for declaration in declarations)
+    )
+    if declares_energy and declares_non_energy:
+        raise SafeStateConfigError(f"{label} has contradictory energy classification")
+
+
 def _validate_bindings(
     expected_devices: Mapping[str, Mapping[str, Any]] | None,
     config: Mapping[str, Any] | None,
@@ -153,6 +203,8 @@ def _validate_bindings(
             safety = spec.get("safety", {})
             if not isinstance(safety, Mapping):
                 raise SafeStateConfigError(f"instrument {name!r} safety must be a mapping")
+            _validate_energy_classification(f"instrument {name!r}", spec, safety)
+            _validate_identity_declarations(f"instrument {name!r}", spec, safety)
             merged = dict(spec)
             merged.update(safety)
             if _expected_identity_fields(merged) is None:
@@ -164,6 +216,8 @@ def _validate_bindings(
     for resource, expected in (expected_devices or {}).items():
         if not isinstance(resource, str) or not resource.strip() or not isinstance(expected, Mapping):
             raise SafeStateConfigError("expected_devices requires non-empty resource-to-mapping bindings")
+        _validate_energy_classification(f"expected device {resource!r}", expected)
+        _validate_identity_declarations(f"expected device {resource!r}", expected)
         expected_model = str(expected.get("expected_model") or expected.get("model") or "").strip()
         is_source = bool(expected.get("energy_source") or expected.get("is_energy_source"))
         if (is_source or expected_model.casefold() in supported_models) and (
@@ -177,15 +231,39 @@ def _validate_bindings(
 def _bindings(expected_devices: Mapping[str, Mapping[str, Any]] | None,
               config: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
     answer: dict[str, dict[str, Any]] = {}
+    resource_keys: dict[str, str] = {}
     for spec in _instrument_specs(config):
         connection = spec.get("connection")
         if isinstance(connection, str) and connection.strip():
+            canonical_resource = connection.strip()
+            nested_safety = spec.get("safety") or {}
+            _validate_identity_declarations(
+                f"expected-equipment binding {canonical_resource!r}", spec, nested_safety
+            )
             merged = dict(spec)
-            merged.update(spec.get("safety") or {})
-            answer[connection.strip()] = merged
+            merged.update(nested_safety)
+            answer[canonical_resource] = merged
+            resource_keys[canonical_resource.casefold()] = canonical_resource
     for resource, expected in (expected_devices or {}).items():
-        answer.setdefault(resource.strip(), {}).update(expected)
+        canonical_resource = resource.strip()
+        resource_key = resource_keys.setdefault(
+            canonical_resource.casefold(), canonical_resource
+        )
+        existing = answer.setdefault(resource_key, {})
+        _validate_energy_classification(
+            f"expected-equipment binding {resource_key!r}", existing, expected
+        )
+        _validate_identity_declarations(
+            f"expected-equipment binding {resource_key!r}", existing, expected
+        )
+        existing.update(expected)
     return answer
+
+
+def _is_labjack_u3_binding(binding: Mapping[str, Any]) -> bool:
+    expected_model = str(binding.get("expected_model") or binding.get("model") or "").strip()
+    model = expected_model.casefold()
+    return model == "u3" or model.startswith("u3-")
 
 
 def _identity_error(idn: str, expected: Mapping[str, Any]) -> str | None:
@@ -252,6 +330,8 @@ def _measurement_state(
 
 
 def _explicitly_non_energy(binding: Mapping[str, Any]) -> bool:
+    if any(binding.get(key) is True for key in ("energy_source", "is_energy_source")):
+        return False
     if binding.get("validated_non_energy") is True:
         return True
     return any(
@@ -270,7 +350,11 @@ def apply_safe_state(resource_names: Iterable[str] | None = None, *,
     unknown device is non-energizing.
     """
     _validate_bindings(expected_devices, config)
-    bindings = _bindings(expected_devices, config)
+    bindings = {
+        resource: binding
+        for resource, binding in _bindings(expected_devices, config).items()
+        if not _is_labjack_u3_binding(binding)
+    }
     rm = pyvisa.ResourceManager("@py")
     try:
         return _apply_safe_state_with_manager(rm, resource_names, bindings)
@@ -358,12 +442,52 @@ def _apply_safe_state_with_manager(
     return results
 
 
-def apply_usb_safe_state() -> list[SafeStateResult]:
-    """Safely bind and de-energize each specifically discovered LabJack U3."""
+def apply_usb_safe_state(
+    *, config: Mapping[str, Any] | None = None
+) -> list[SafeStateResult]:
+    """De-energize only LabJack U3s exactly bound by expected-equipment config.
+
+    With no config this performs read-only USB discovery and reports each U3 as
+    unverifiable. A configured write requires the discovered resource and exact
+    manufacturer/model/serial identity to match its inventory record.
+    """
+    _validate_bindings(None, config)
+    labjack_bindings = {
+        resource: binding
+        for resource, binding in _bindings(None, config).items()
+        if _is_labjack_u3_binding(binding)
+    }
+    discovered = {
+        identity.resource: identity
+        for identity in discover_usb()
+        if (identity.vendor_id, identity.product_id) == ("0cd5", "0003")
+    }
+    resources = tuple(dict.fromkeys((*discovered, *labjack_bindings)))
     results = []
-    for identity in discover_usb():
-        if (identity.vendor_id, identity.product_id) != ("0cd5", "0003"):
+    for resource in resources:
+        identity = discovered.get(resource)
+        binding = labjack_bindings.get(resource)
+        if identity is None:
+            results.append(SafeStateResult(
+                resource, "UNKNOWN", "U3", (), (),
+                ("configured LabJack U3 was not discovered at its bound resource",),
+                "unverifiable",
+            ))
             continue
+        if binding is None:
+            results.append(SafeStateResult(
+                resource, identity.idn, "U3", (), (),
+                ("no-config device was identified by read-only discovery only; safe state cannot be verified",),
+                "unverifiable",
+            ))
+            continue
+        mismatch = _identity_error(identity.idn, binding)
+        if mismatch:
+            results.append(SafeStateResult(
+                resource, identity.idn, "U3", (), (), (mismatch,), "unverifiable"
+            ))
+            continue
+
         actions: list[str] = []
         checks: list[tuple[str, str]] = []
         errors: list[str] = []
@@ -388,7 +512,7 @@ def apply_usb_safe_state() -> list[SafeStateResult]:
                 except Exception:
                     pass
         state: SafeState = "verified_safe" if not errors else "unverifiable"
-        results.append(SafeStateResult(identity.resource, identity.idn, "U3", tuple(actions), tuple(checks), tuple(errors), state))
+        results.append(SafeStateResult(resource, identity.idn, "U3", tuple(actions), tuple(checks), tuple(errors), state))
     return results
 
 
@@ -415,7 +539,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     except SafeStateConfigError as exc:
         print(f"safe-state config error: {exc}")
         return 2
-    results = [*visa_results, *apply_usb_safe_state()]
+    usb_results = apply_usb_safe_state(config=config) if config is not None else apply_usb_safe_state()
+    results = [*visa_results, *usb_results]
     for item in results:
         print(f"\n{item.resource}\n  IDN: {item.idn}\n  Model: {item.model}\n  State: {item.state}")
         print("  Safe actions:" if item.actions else "  Safe actions: none required/known")

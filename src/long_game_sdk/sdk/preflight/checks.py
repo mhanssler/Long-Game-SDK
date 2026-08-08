@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 import os
+import re
 import subprocess
 
 import yaml
@@ -19,7 +20,7 @@ import yaml
 from long_game_sdk.sdk.preflight import instrument_checks
 from long_game_sdk.sdk.preflight.environment_checks import run_environment_checks
 from long_game_sdk.sdk.preflight.instrument_checks import InstrumentAdapter, run_instrument_checks
-from long_game_sdk.sdk.preflight.safety_checks import run_safety_checks
+from long_game_sdk.sdk.preflight.safety_checks import energy_control_kind, run_safety_checks
 
 SUPPORTED_CHECKS = frozenset({
     "identity",
@@ -35,12 +36,37 @@ class PreflightConfigError(ValueError):
     """Raised before resource access when a preflight inventory is unsafe or malformed."""
 
 
-def _is_energy_source(spec: Mapping[str, Any]) -> bool:
-    safety = spec.get("safety")
+def _query_addresses_channel(query: str, channel: str, query_field: str) -> bool:
+    """Return whether a trusted DP832 query explicitly selects ``channel``.
+
+    Malformed/non-read-only commands are left to the safety check layer so they
+    remain structured report failures rather than inventory-shape errors.
+    """
+    trusted_patterns = {
+        "output_query": re.compile(
+            r"^:?(?:OUTP(?:UT)?)(?:\s*:\s*STAT(?:E)?)?\?\s*(?:CH(?:AN(?:NEL)?)?\s*\d+)?$",
+            re.IGNORECASE,
+        ),
+        "voltage_query": re.compile(
+            r"^:?(?:(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?VOLT(?:AGE)?(?:\s*:\s*LEV(?:EL)?)?|MEAS(?:URE)?\s*:\s*VOLT(?:AGE)?)\?$",
+            re.IGNORECASE,
+        ),
+        "current_query": re.compile(
+            r"^:?(?:(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?CURR(?:ENT)?(?:\s*:\s*LEV(?:EL)?)?|MEAS(?:URE)?\s*:\s*CURR(?:ENT)?)\?$",
+            re.IGNORECASE,
+        ),
+    }
+    if trusted_patterns[query_field].fullmatch(query.strip()) is None:
+        return True
+    match = re.fullmatch(r"CH(\d+)", channel.strip(), re.IGNORECASE)
+    if match is None:
+        return False
+    number = re.escape(match.group(1))
+    # DP832 output state queries select a ``CHn`` argument, while source
+    # voltage/current queries encode the same channel in ``SOURce<n>``.
     return bool(
-        spec.get("energy_source")
-        or spec.get("is_energy_source")
-        or (isinstance(safety, Mapping) and (safety.get("energy_source") or safety.get("is_energy_source")))
+        re.search(rf"(?<![A-Z0-9])CH(?:AN(?:NEL)?)?\s*{number}(?!\d)", query, re.IGNORECASE)
+        or re.search(rf"(?<![A-Z0-9])SOUR(?:CE)?\s*{number}(?!\d)", query, re.IGNORECASE)
     )
 
 
@@ -91,7 +117,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         safety = raw_spec.get("safety", {})
         if not isinstance(safety, Mapping):
             raise PreflightConfigError(f"instrument {name!r} safety must be a mapping")
-        if _is_energy_source(raw_spec):
+        control_kind = energy_control_kind(raw_spec)
+        if control_kind == "source":
             for field_name in ("expected_manufacturer", "expected_model", "expected_serial"):
                 value = raw_spec.get(field_name)
                 if not isinstance(value, str) or not value.strip():
@@ -126,11 +153,31 @@ def validate_config(config: Mapping[str, Any]) -> None:
                         raise PreflightConfigError(
                             f"energy source {name!r} channel {channel_name!r} requires {field_name}"
                         )
+                for query_field in ("output_query", "voltage_query", "current_query"):
+                    query = channel.get(query_field)
+                    if isinstance(query, str) and query.strip() and not _query_addresses_channel(
+                        query, channel_name, query_field
+                    ):
+                        raise PreflightConfigError(
+                            f"energy source {name!r} channel {channel_name!r} {query_field} "
+                            f"must explicitly address {channel_name.strip()}"
+                        )
             if str(raw_spec.get("expected_model", "")).strip().casefold() == "dp832" and channel_names != {
                 "ch1", "ch2", "ch3"
             }:
                 raise PreflightConfigError(
                     f"DP832 energy source {name!r} requires explicit CH1, CH2, and CH3 evidence"
+                )
+        elif control_kind == "load":
+            required = (
+                "input_query", "voltage_limit", "voltage_query", "current_limit",
+                "current_query", "power_limit", "power_query",
+            )
+            missing = [field_name for field_name in required if field_name not in safety]
+            if missing:
+                raise PreflightConfigError(
+                    f"DL3021 energy-controlling load {name!r} requires explicit input-state, voltage, "
+                    f"current, and power live evidence; missing {', '.join(missing)}"
                 )
     runtime = config.get("runtime", {})
     if not isinstance(runtime, Mapping):

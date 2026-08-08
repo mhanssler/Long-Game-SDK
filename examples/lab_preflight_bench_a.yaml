@@ -45,6 +45,8 @@ rig:
         - calibration_date
       safety:
         calibration_due: 2027-06-01
+        # Reviewed bench classification: this oscilloscope does not source DUT energy.
+        validated_non_energy: true
 runtime:
   operator: ""
   dut_serial: ""

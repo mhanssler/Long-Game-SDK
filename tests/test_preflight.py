@@ -5,6 +5,7 @@ import pytest
 from long_game_sdk.sdk.preflight import instrument_checks
 from long_game_sdk.sdk.preflight.checks import PreflightConfigError, run_preflight
 from long_game_sdk.sdk.preflight.report import render_markdown
+from long_game_sdk.sdk.preflight.safety_checks import is_energy_controlling, is_energy_source
 
 
 class FakeInstrument:
@@ -57,6 +58,51 @@ def _safety_config(safety: dict, checks: list[str] | None = None):
         },
         "runtime": {},
     }
+
+
+def _valid_dp832_safety(**overrides):
+    safety = {
+        "energy_source": True,
+        "output_query": ":OUTPut? CH1",
+        "voltage_limit": 5.5,
+        "voltage_query": ":SOURce1:VOLTage?",
+        "current_limit": 1.0,
+        "current_query": ":SOURce1:CURRent?",
+    }
+    safety.update(overrides)
+    return safety
+
+
+def _dl3021_config(safety: dict | None = None):
+    return {
+        "rig": {
+            "name": "load-bench",
+            "dut_type": "pcba",
+            "instruments": [{
+                "name": "electronic_load",
+                "expected_manufacturer": "RIGOL",
+                "expected_model": "DL3021",
+                "expected_serial": "DL3-123",
+                "checks": ["identity"],
+                "safety": dict(safety or {}),
+            }],
+        },
+        "runtime": {},
+    }
+
+
+def _valid_dl3021_safety(**overrides):
+    safety = {
+        "input_query": ":INPut?",
+        "voltage_limit": 0.1,
+        "voltage_query": ":MEASure:VOLTage?",
+        "current_limit": 0.01,
+        "current_query": ":MEASure:CURRent?",
+        "power_limit": 0.001,
+        "power_query": ":MEASure:POWer?",
+    }
+    safety.update(overrides)
+    return safety
 
 
 @pytest.mark.parametrize(
@@ -138,6 +184,109 @@ def test_dp832_energy_source_requires_explicit_live_evidence_for_all_channels() 
     config["rig"]["instruments"][0]["safety"]["channels"].pop()
 
     with pytest.raises(PreflightConfigError, match="CH1, CH2, and CH3"):
+        run_preflight(config, instruments={})
+
+
+def test_dp832_cannot_opt_out_of_energy_source_requirements_by_omitting_flag() -> None:
+    config = _safety_config({}, checks=["identity"])
+
+    with pytest.raises(PreflightConfigError, match="safety.channels readback evidence"):
+        run_preflight(config, instruments={})
+
+
+def test_fully_bound_dp832_without_flag_still_runs_channel_safety_checks(tmp_path) -> None:
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
+    config["rig"]["instruments"][0]["safety"].pop("energy_source")
+    responses = {"*IDN?": "RIGOL,DP832,SN1,1"}
+    for channel in (1, 2, 3):
+        responses[f":OUTPut? CH{channel}"] = "ON" if channel == 2 else "OFF"
+        responses[f":SOURce{channel}:VOLTage?"] = "0 V"
+        responses[f":SOURce{channel}:CURRent?"] = "0 A"
+
+    report = run_preflight(
+        config,
+        instruments={"main_psu": FakeInstrument(responses)},
+        env={},
+        repo=tmp_path,
+    )
+
+    assert not report.ready
+    assert any(
+        item.name == "output_disabled_on_start"
+        and item.status == "fail"
+        and item.evidence.get("channel") == "CH2"
+        for item in report.results
+    )
+
+
+def test_exact_rigol_dl3021_is_energy_controlling_but_not_an_energy_source() -> None:
+    spec = _dl3021_config()["rig"]["instruments"][0]
+
+    assert is_energy_controlling(spec)
+    assert not is_energy_source(spec)
+
+
+def test_dl3021_cannot_pass_identity_only_without_safe_input_and_live_readbacks() -> None:
+    with pytest.raises(PreflightConfigError, match="DL3021.*input-state, voltage, current, and power"):
+        run_preflight(_dl3021_config(), instruments={})
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "input_query", "voltage_limit", "voltage_query", "current_limit",
+        "current_query", "power_limit", "power_query",
+    ],
+)
+def test_dl3021_requires_each_explicit_safe_input_and_live_readback_field(missing) -> None:
+    safety = _valid_dl3021_safety()
+    safety.pop(missing)
+
+    with pytest.raises(PreflightConfigError, match=missing):
+        run_preflight(_dl3021_config(safety), instruments={})
+
+
+def test_identity_only_dl3021_still_runs_all_intrinsic_safety_checks(tmp_path) -> None:
+    responses = {
+        "*IDN?": "RIGOL,DL3021,DL3-123,1",
+        ":INPut?": "ON",
+        ":MEASure:VOLTage?": "0 V",
+        ":MEASure:CURRent?": "0 A",
+        ":MEASure:POWer?": "0 W",
+    }
+
+    report = run_preflight(
+        _dl3021_config(_valid_dl3021_safety()),
+        instruments={"electronic_load": FakeInstrument(responses)},
+        env={},
+        repo=tmp_path,
+    )
+
+    assert not report.ready
+    safety_results = [item for item in report.results if item.category == "safety"]
+    assert {item.name for item in safety_results} >= {
+        "input_disabled_on_start", "voltage_limit", "current_limit", "power_limit",
+    }
+    assert next(item for item in safety_results if item.name == "input_disabled_on_start").status == "fail"
+    for name in ("voltage_limit", "current_limit", "power_limit"):
+        evidence = next(item.evidence for item in safety_results if item.name == name)
+        assert {"query", "response", "actual"} <= evidence.keys()
+
+
+@pytest.mark.parametrize("query_field", ["output_query", "voltage_query", "current_query"])
+def test_energy_source_channel_queries_must_address_the_labeled_channel(query_field) -> None:
+    config = _safety_config({
+        "energy_source": True,
+        "output_query": ":OUTPut? CH1",
+        "voltage_limit": 5.5,
+        "voltage_query": ":SOURce1:VOLTage?",
+        "current_limit": 1.0,
+        "current_query": ":SOURce1:CURRent?",
+    })
+    channels = config["rig"]["instruments"][0]["safety"]["channels"]
+    channels[1][query_field] = channels[0][query_field]
+
+    with pytest.raises(PreflightConfigError, match=rf"channel 'CH2'.*{query_field}.*address CH2"):
         run_preflight(config, instruments={})
 
 
@@ -264,8 +413,10 @@ def test_preflight_rejects_invalid_limits(tmp_path):
     for key, bad_value in (("voltage_limit", "CH1 <= 5.5 V"), ("voltage_limit", float("nan")),
                            ("current_limit", -1), ("current_limit", True),
                            ("current_limit", {"value": 1.0})):
-        safety = {"output_query": ":OUTPut? CH1", "voltage_limit": {"value": 5.5, "unit": "V"},
-                  "current_limit": {"value": 1.0, "unit": "A"}}
+        safety = _valid_dp832_safety(
+            voltage_limit={"value": 5.5, "unit": "V"},
+            current_limit={"value": 1.0, "unit": "A"},
+        )
         safety[key] = bad_value
         report = run_preflight(_safety_config(safety), instruments={"main_psu": FakeInstrument(
             {"*IDN?": "RIGOL,DP832,SN1,1", ":OUTPut? CH1": "OFF"})}, env={}, repo=tmp_path)
@@ -318,7 +469,10 @@ def test_preflight_rejects_non_read_only_or_untrusted_queries(tmp_path, field, v
 
 @pytest.mark.parametrize("due", ["not-a-date", "2020-01-01", "2027-02-30"])
 def test_preflight_calibration_due_must_be_valid_and_not_expired(tmp_path, due) -> None:
-    config = _safety_config({"calibration_due": due}, checks=["identity", "calibration_date"])
+    config = _safety_config(
+        _valid_dp832_safety(calibration_due=due),
+        checks=["identity", "calibration_date"],
+    )
     report = run_preflight(
         config,
         instruments={"main_psu": FakeInstrument({"*IDN?": "RIGOL,DP832,SN1,1"})},
@@ -408,7 +562,7 @@ def test_preflight_energy_source_missing_or_failed_output_readback_fails(tmp_pat
 
 
 def test_preflight_expected_serial_binding_must_match(tmp_path):
-    config = _safety_config({}, checks=["identity"])
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
     config["rig"]["instruments"][0]["expected_serial"] = "BOUND-123"
     report = run_preflight(config, instruments={"main_psu": FakeInstrument(
         {"*IDN?": "RIGOL,DP832,OTHER-999,1"})}, env={}, repo=tmp_path)

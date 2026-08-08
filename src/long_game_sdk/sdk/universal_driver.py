@@ -106,6 +106,10 @@ class UniversalDriver:
                 instrument = self.rm.open_resource(resource_name)
                 opened_instrument = True
             self.instrument: Any = instrument
+            # Pin the transport object used to establish identity. A matching
+            # response from a subsequently substituted object must not inherit
+            # this driver's mutation authority.
+            self._identity_instrument: Any = instrument
             self.schema_trusted = bool(trusted_schema)
             self.identity_verified = False
             self.identity_response: str | None = None
@@ -223,10 +227,13 @@ class UniversalDriver:
                     "and parameter metadata before enabling mutation"
                 )
             is_write = operation in _WRITE_OPERATIONS
+            dispatch_instrument = self.instrument
             if is_write:
                 # Validate trust, identity, arming, and raw argument values before
                 # formatting any caller-controlled data into instrument syntax.
-                args, kwargs = self._assert_mutation_allowed(template, args, kwargs, parameters)
+                args, kwargs = self._assert_mutation_allowed(
+                    template, args, kwargs, parameters, dispatch_instrument
+                )
             try:
                 command = template.format(*args, **kwargs)
             except (IndexError, KeyError, ValueError, AttributeError) as error:
@@ -236,10 +243,13 @@ class UniversalDriver:
             self._reject_multiple_commands(command)
 
             dispatch_operation = "write" if is_write else "read"
+            if is_write and self.instrument is not dispatch_instrument:
+                self.identity_verified = False
+                raise MutationSafetyError("instrument object changed during mutation authorization")
             try:
                 if is_write:
-                    return self.instrument.write(command)
-                return self.instrument.query(command)
+                    return dispatch_instrument.write(command)
+                return dispatch_instrument.query(command)
             except Exception as error:
                 raise self._instrument_error(error, command, dispatch_operation) from error
 
@@ -262,6 +272,10 @@ class UniversalDriver:
 
     def verify_identity(self) -> bool:
         """Verify schema compatibility and an exact, out-of-band physical binding."""
+        return self._verify_identity_on(self.instrument)
+
+    def _verify_identity_on(self, instrument: Any) -> bool:
+        """Verify identity using one transport object for the complete query."""
         identification = self.schema.get("identification", {})
         pattern = identification.get("idn_pattern") if isinstance(identification, Mapping) else None
         self.identity_verified = False
@@ -269,7 +283,7 @@ class UniversalDriver:
         if not isinstance(pattern, str) or not pattern:
             return False
         try:
-            response = str(self.instrument.query("*IDN?")).strip().replace("\x00", "")
+            response = str(instrument.query("*IDN?")).strip().replace("\x00", "")
             self.identity_response = response
             fields = self._parse_idn(response)
             self.identity_fields = fields
@@ -360,6 +374,7 @@ class UniversalDriver:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         parameters: Mapping[str, Any],
+        instrument: Any,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         if not self.schema_trusted:
             raise MutationSafetyError("mutating commands require an explicitly trusted schema")
@@ -367,10 +382,18 @@ class UniversalDriver:
             raise MutationSafetyError(
                 "mutating commands require an expected out-of-band manufacturer/model/serial binding"
             )
-        if not self.identity_verified:
-            raise MutationSafetyError("mutating commands require exact verified instrument identity")
         if not self._armed_context.get():
             raise MutationSafetyError("mutating commands require an active armed execution context")
+        if instrument is not self._identity_instrument:
+            self.identity_verified = False
+            raise MutationSafetyError(
+                "instrument object changed after identity binding; mutation identity is no longer verified"
+            )
+        # Cached identity is insufficient at a mutation boundary: re-read the
+        # physical instrument immediately before every armed write so a device
+        # replacement or changed identity fails closed.
+        if not self._verify_identity_on(instrument):
+            raise MutationSafetyError("mutating commands require exact verified instrument identity")
         return self._validate_numeric_bounds(template, args, kwargs, parameters)
 
     @staticmethod

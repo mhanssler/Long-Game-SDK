@@ -23,8 +23,10 @@ Best first workflow for consulting and early product use.
 ```bash
 uv run lg-schematic-import examples/guided_test_setup/bms_pin_map.csv \
   --dut-name bms_controller \
-  -o examples/guided_test_setup/bms_schematic_context.yaml
+  -o reports/schematic-import/bms_pin_map_import.yaml
 ```
+
+This raw import is an inspection artifact. It intentionally does not infer a schematic revision or approved instrument-to-DUT connection records, so keep it separate from reviewed context such as `examples/guided_test_setup/bms_schematic_context.yaml`. Do not pass raw importer output to `lg-guide-test` until those records have been independently reviewed and added.
 
 Accepted headers include:
 

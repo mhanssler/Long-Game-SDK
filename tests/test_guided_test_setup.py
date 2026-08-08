@@ -473,3 +473,70 @@ def test_connection_rejects_noncanonical_or_missing_isolation_metadata(
 
     with pytest.raises(GuidedSetupError, match="isolation"):
         build_context_pack(req_path, "BMS-REQ-002", bench_path, schematic_path)
+
+
+def test_context_pack_rejects_non_list_schematic_connections(tmp_path: Path) -> None:
+    req_path, bench_path, schematic_path = _write_inputs(tmp_path)
+    schematic = yaml.safe_load(schematic_path.read_text())
+    schematic["schematic_context"]["connections"] = {"approved": True}
+    schematic_path.write_text(yaml.safe_dump(schematic, sort_keys=False))
+
+    with pytest.raises(GuidedSetupError, match="connections must be a list"):
+        build_context_pack(req_path, "BMS-REQ-002", bench_path, schematic_path)
+
+
+def test_context_pack_requires_energizing_classification_for_alternate_reference_instrument(
+    tmp_path: Path,
+) -> None:
+    req_path, bench_path, schematic_path = _write_inputs(tmp_path)
+    bench = yaml.safe_load(bench_path.read_text())
+    bench["instruments"][0].pop("energizing")
+    bench_path.write_text(yaml.safe_dump(bench, sort_keys=False))
+    schematic = yaml.safe_load(schematic_path.read_text())
+    schematic["schematic_context"]["connections"] = schematic["schematic_context"][
+        "connections"
+    ][:1]
+    schematic["schematic_context"]["connections"][0]["reference"].update(
+        instrument="cell_simulator", instrument_terminal="COM"
+    )
+    schematic_path.write_text(yaml.safe_dump(schematic, sort_keys=False))
+
+    with pytest.raises(GuidedSetupError, match="explicit boolean energizing classification"):
+        build_context_pack(req_path, "BMS-REQ-002", bench_path, schematic_path)
+
+
+@pytest.mark.parametrize("canonical_namespace", ["terminal", "connector", "pin", "test_point"])
+def test_context_pack_rejects_casefolded_whitespace_aliases_in_canonical_names(
+    tmp_path: Path, canonical_namespace: str
+) -> None:
+    req_path, bench_path, schematic_path = _write_inputs(tmp_path)
+    bench = yaml.safe_load(bench_path.read_text())
+    schematic = yaml.safe_load(schematic_path.read_text())
+
+    if canonical_namespace == "terminal":
+        terminals = bench["instruments"][1]["terminals"]
+        terminals[" d0 "] = dict(terminals["D0"])
+        bench_path.write_text(yaml.safe_dump(bench, sort_keys=False))
+    else:
+        dut = schematic["schematic_context"]["dut"]
+        if canonical_namespace == "connector":
+            dut["connectors"][" j1 "] = dict(dut["connectors"]["J1"])
+        elif canonical_namespace == "pin":
+            pins = dut["connectors"]["J1"]["pins"]
+            pins[" 7 "] = dict(pins["7"])
+        else:
+            dut["test_points"][" tp12 "] = dict(dut["test_points"]["TP12"])
+        schematic_path.write_text(yaml.safe_dump(schematic, sort_keys=False))
+
+    with pytest.raises(GuidedSetupError, match=f"ambiguous canonical {canonical_namespace}"):
+        build_context_pack(req_path, "BMS-REQ-002", bench_path, schematic_path)
+
+
+def test_context_pack_reports_huge_integer_limit_as_guided_setup_error(tmp_path: Path) -> None:
+    req_path, bench_path, schematic_path = _write_inputs(tmp_path)
+    schematic = yaml.safe_load(schematic_path.read_text())
+    schematic["schematic_context"]["connections"][0]["max_voltage_v"] = 10**1000
+    schematic_path.write_text(yaml.safe_dump(schematic, sort_keys=False))
+
+    with pytest.raises(GuidedSetupError, match="finite non-negative numeric max_voltage_v"):
+        build_context_pack(req_path, "BMS-REQ-002", bench_path, schematic_path)

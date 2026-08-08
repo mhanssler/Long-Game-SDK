@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -269,6 +271,178 @@ def test_unknown_expected_instrument_requires_explicit_non_energy_validation(mon
 
 
 @pytest.mark.parametrize(
+    "classification",
+    [
+        {"energy_source": True, "is_energy_source": False},
+        {"energy_source": False, "is_energy_source": True},
+        {"energy_source": True, "validated_non_energy": True},
+        {"is_energy_source": True, "validated_non_energy": True},
+    ],
+)
+def test_contradictory_energy_classification_is_rejected_before_resource_access(
+    monkeypatch, classification
+):
+    resource_manager_calls = []
+    monkeypatch.setattr(
+        safety.pyvisa,
+        "ResourceManager",
+        lambda *_: resource_manager_calls.append(True) or FakeRM({}),
+    )
+    expected = {
+        "expected_manufacturer": "ACME",
+        "expected_model": "MYSTERY",
+        "expected_serial": "SN-1",
+        **classification,
+    }
+
+    with pytest.raises(safety.SafeStateConfigError, match="contradictory energy classification"):
+        safety.apply_safe_state(expected_devices={"USB::UNKNOWN": expected})
+
+    assert resource_manager_calls == []
+
+
+def test_nested_inventory_energy_classification_conflict_is_rejected_before_resource_access(
+    monkeypatch,
+):
+    resource_manager_calls = []
+    monkeypatch.setattr(
+        safety.pyvisa,
+        "ResourceManager",
+        lambda *_: resource_manager_calls.append(True) or FakeRM({}),
+    )
+    config = {"rig": {"instruments": [{
+        "name": "mystery",
+        "connection": "USB::UNKNOWN",
+        "expected_manufacturer": "ACME",
+        "expected_model": "MYSTERY",
+        "expected_serial": "SN-1",
+        "energy_source": True,
+        "safety": {"energy_source": False},
+    }]}}
+
+    with pytest.raises(safety.SafeStateConfigError, match="contradictory energy classification"):
+        safety.apply_safe_state(config=config)
+
+    assert resource_manager_calls == []
+
+
+def test_cross_input_energy_classification_conflict_is_rejected_before_resource_access(
+    monkeypatch,
+):
+    resource = "USB::UNKNOWN"
+    resource_manager_calls = []
+    monkeypatch.setattr(
+        safety.pyvisa,
+        "ResourceManager",
+        lambda *_: resource_manager_calls.append(True) or FakeRM({}),
+    )
+    config = {"rig": {"instruments": [{
+        "name": "mystery",
+        "connection": resource,
+        "expected_manufacturer": "ACME",
+        "expected_model": "MYSTERY",
+        "expected_serial": "SN-1",
+        "energy_source": True,
+    }]}}
+    expected_devices = {resource: {
+        "expected_manufacturer": "ACME",
+        "expected_model": "MYSTERY",
+        "expected_serial": "SN-1",
+        "energy_source": False,
+    }}
+
+    with pytest.raises(safety.SafeStateConfigError, match="contradictory energy classification"):
+        safety.apply_safe_state(config=config, expected_devices=expected_devices)
+
+    assert resource_manager_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_alias", "conflicting_value"),
+    [
+        ("manufacturer", "manufacturer", "OTHER"),
+        ("model", "model", "DL3021"),
+        ("serial", "serial", "WRONG"),
+    ],
+)
+def test_nested_safety_exact_identity_conflict_is_rejected_before_resource_access(
+    monkeypatch, field, conflicting_alias, conflicting_value
+):
+    resource_manager_calls = []
+    monkeypatch.setattr(
+        safety.pyvisa,
+        "ResourceManager",
+        lambda *_: resource_manager_calls.append(True) or FakeRM({}),
+    )
+    config = {"rig": {"instruments": [{
+        "name": "psu",
+        "connection": "USB::DP832",
+        "expected_manufacturer": "RIGOL",
+        "expected_model": "DP832",
+        "expected_serial": "RIGHT",
+        "safety": {conflicting_alias: conflicting_value},
+    }]}}
+
+    with pytest.raises(safety.SafeStateConfigError, match=field):
+        safety.apply_safe_state(config=config)
+
+    assert resource_manager_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("manufacturer", "OTHER"),
+        ("model", "DL3021"),
+        ("serial", "WRONG"),
+    ],
+)
+def test_cross_input_exact_identity_conflict_is_rejected_before_resource_access(
+    monkeypatch, field, conflicting_value
+):
+    resource_manager_calls = []
+    monkeypatch.setattr(
+        safety.pyvisa,
+        "ResourceManager",
+        lambda *_: resource_manager_calls.append(True) or FakeRM({}),
+    )
+    resource = "USB::DP832"
+    config = {"rig": {"instruments": [{
+        "name": "psu",
+        "connection": resource,
+        "expected_manufacturer": "RIGOL",
+        "expected_model": "DP832",
+        "expected_serial": "RIGHT",
+    }]}}
+    expected = {
+        "expected_manufacturer": "rigol",
+        "expected_model": "dp832",
+        "expected_serial": "right",
+    }
+    expected[f"expected_{field}"] = conflicting_value
+    expected_devices = {f"  {resource.lower()}  ": expected}
+
+    with pytest.raises(safety.SafeStateConfigError, match=field):
+        safety.apply_safe_state(config=config, expected_devices=expected_devices)
+
+    assert resource_manager_calls == []
+
+
+def test_documented_bench_example_explicitly_reviews_scope_as_non_energy():
+    repository = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load(
+        (repository / "examples/lab_preflight_bench_a.yaml").read_text(encoding="utf-8")
+    )
+    scope = next(
+        spec for spec in config["rig"]["instruments"] if spec["expected_model"] == "DS1102E"
+    )
+
+    assert scope["expected_manufacturer"] == "RIGOL TECHNOLOGIES"
+    assert scope["expected_serial"] == "DS1ZA000000000"
+    assert scope["safety"]["validated_non_energy"] is True
+
+
+@pytest.mark.parametrize(
     "config",
     [
         {},
@@ -367,7 +541,12 @@ def test_labjack_acknowledged_dac_writes_are_unverifiable_without_dac_readback(m
             return 0.0
         def close(self): pass
     monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
-    result = safety.apply_usb_safe_state()[0]
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3",
+        "expected_serial": "470012345",
+    }]}}
+    result = safety.apply_usb_safe_state(config=config)[0]
     assert seen == ["470012345"]
     assert ain_reads == []
     assert result.actions == ("DAC0=0.0 V", "DAC1=0.0 V")
@@ -375,6 +554,63 @@ def test_labjack_acknowledged_dac_writes_are_unverifiable_without_dac_readback(m
     assert result.state == "unverifiable"
     assert not result.safe
     assert any("DAC readback" in error for error in result.errors)
+
+
+def test_no_config_labjack_discovery_is_strictly_read_only(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3",
+        serial="470012345", idn="LabJack,U3,470012345",
+        vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+    opened = []
+    monkeypatch.setattr(safety, "LabJackU3Driver", lambda **kwargs: opened.append(kwargs))
+
+    result = safety.apply_usb_safe_state()[0]
+
+    assert opened == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+    assert any("read-only discovery" in error for error in result.errors)
+
+
+def test_configured_labjack_identity_mismatch_performs_zero_dac_writes(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3",
+        serial="WRONG", idn="LabJack,U3,WRONG", vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+    opened = []
+    monkeypatch.setattr(safety, "LabJackU3Driver", lambda **kwargs: opened.append(kwargs))
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3",
+        "expected_serial": "RIGHT",
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)[0]
+
+    assert opened == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+    assert any("identity mismatch" in error for error in result.errors)
+
+
+def test_configured_labjack_missing_from_discovery_is_unverifiable(monkeypatch):
+    monkeypatch.setattr(safety, "discover_usb", lambda: [])
+    resource = "USB::0cd5::0003::serial470012345"
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3",
+        "expected_serial": "470012345",
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)
+
+    assert len(result) == 1
+    assert result[0].resource == resource
+    assert result[0].state == "unverifiable"
+    assert any("not discovered" in error for error in result[0].errors)
 
 
 def test_labjack_unknown_serial_is_unverifiable_without_opening_driver(monkeypatch):
@@ -390,6 +626,24 @@ def test_safe_cli_returns_nonzero_for_blocking_result(monkeypatch):
     monkeypatch.setattr(safety, "apply_safe_state", lambda: [blocked])
     monkeypatch.setattr(safety, "apply_usb_safe_state", lambda: [])
     assert safety.main([]) != 0
+
+
+def test_safe_cli_passes_config_to_labjack_binding(monkeypatch, tmp_path):
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": "USB::0cd5::0003::serial470012345",
+        "expected_manufacturer": "LabJack", "expected_model": "U3",
+        "expected_serial": "470012345",
+    }]}}
+    config_path = tmp_path / "bench.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    seen = []
+    monkeypatch.setattr(safety, "apply_safe_state", lambda **kwargs: [])
+    monkeypatch.setattr(
+        safety, "apply_usb_safe_state", lambda **kwargs: seen.append(kwargs) or []
+    )
+
+    assert safety.main([str(config_path)]) == 0
+    assert seen == [{"config": config}]
 
 
 def test_safe_cli_loads_expected_equipment_config_and_fails_when_discovery_is_empty(

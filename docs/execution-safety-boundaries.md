@@ -22,6 +22,10 @@ Generated/manual-enriched schemas must remain untrusted until reviewed.
 
 Running `lg-safe` without a config is **read-only discovery**. It does not issue model-specific de-energization commands because no exact out-of-band identity binding is available. Supported and unknown instruments remain unverifiable, so no-config mode is not proof that a bench is present or safe and must never be used as an expected-equipment or safe-state gate.
 
+## Hardware smoke
+
+`lg-smoke CONFIG.yaml` requires the same exact `rig.instruments` expected-equipment inventory. It attempts both VISA and USB safe-state operations and refuses all discovery and identity/read-only probes unless every result is positively `verified_safe` or is an explicitly validated non-energy instrument. The complete safe-state operation runs again in the outermost cleanup path, including when the initial gate, discovery, or a probe fails. An unsafe/unverifiable initial or final result is blocking and returns status 2; probe errors return status 1. There is no permissive no-config CLI mode.
+
 ## Preflight
 
 Safety limits must be finite, non-negative typed values with canonical units. If a source is expected, its output state and configured/queried setpoints must be verifiable. Missing or malformed data fails preflight rather than degrading to a warning.

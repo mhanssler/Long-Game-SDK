@@ -9,7 +9,8 @@ from typing import Any, Mapping
 from long_game_sdk.sdk.preflight.instrument_checks import InstrumentAdapter
 from long_game_sdk.sdk.preflight.results import result
 
-_UNITS = {"voltage_limit": "V", "current_limit": "A"}
+_SOURCE_UNITS = {"voltage_limit": "V", "current_limit": "A"}
+_LOAD_UNITS = {**_SOURCE_UNITS, "power_limit": "W"}
 _NUMBER = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?)\s*([A-Za-z]+)?\s*$")
 _QUERY_SCHEMAS = {
     "output_query": re.compile(
@@ -17,11 +18,19 @@ _QUERY_SCHEMAS = {
         re.IGNORECASE,
     ),
     "voltage_query": re.compile(
-        r"^:?(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?VOLT(?:AGE)?(?:\s*:\s*LEV(?:EL)?)?\?$",
+        r"^:?(?:(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?VOLT(?:AGE)?(?:\s*:\s*LEV(?:EL)?)?|MEAS(?:URE)?\s*:\s*VOLT(?:AGE)?)\?$",
         re.IGNORECASE,
     ),
     "current_query": re.compile(
-        r"^:?(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?CURR(?:ENT)?(?:\s*:\s*LEV(?:EL)?)?\?$",
+        r"^:?(?:(?:(?:SOUR(?:CE)?)\s*\d*\s*:)?CURR(?:ENT)?(?:\s*:\s*LEV(?:EL)?)?|MEAS(?:URE)?\s*:\s*CURR(?:ENT)?)\?$",
+        re.IGNORECASE,
+    ),
+    "input_query": re.compile(
+        r"^:?(?:INP(?:UT)?)(?:\s*:\s*STAT(?:E)?)?\?$",
+        re.IGNORECASE,
+    ),
+    "power_query": re.compile(
+        r"^:?(?:MEAS(?:URE)?\s*:\s*POW(?:ER)?)\?$",
         re.IGNORECASE,
     ),
 }
@@ -35,8 +44,47 @@ def _adapter_for(name: str, instruments: Mapping[str, InstrumentAdapter] | None)
     return instruments.get(name) if instruments else None
 
 
+def _has_exact_identity(spec: Mapping[str, Any]) -> bool:
+    return all(
+        isinstance(value, str) and bool(value.strip())
+        for value in (
+            spec.get("expected_manufacturer"),
+            spec.get("expected_model"),
+            spec.get("expected_serial"),
+        )
+    )
+
+
+def energy_control_kind(spec: Mapping[str, Any]) -> str | None:
+    """Return ``source`` or ``load`` for explicitly or intrinsically controlled energy."""
+    manufacturer = str(spec.get("expected_manufacturer", "")).strip().casefold()
+    model = str(spec.get("expected_model", "")).strip().casefold()
+    if _has_exact_identity(spec) and model == "dp832":
+        return "source"
+    if _has_exact_identity(spec) and manufacturer == "rigol" and model == "dl3021":
+        return "load"
+    safety = spec.get("safety")
+    if (
+        spec.get("energy_source")
+        or spec.get("is_energy_source")
+        or (isinstance(safety, Mapping) and (safety.get("energy_source") or safety.get("is_energy_source")))
+    ):
+        return "source"
+    return None
+
+
+def is_energy_source(spec: Mapping[str, Any]) -> bool:
+    """Return whether the instrument sources energy (electronic loads do not)."""
+    return energy_control_kind(spec) == "source"
+
+
+def is_energy_controlling(spec: Mapping[str, Any]) -> bool:
+    """Return whether the instrument can source or actively sink controlled energy."""
+    return energy_control_kind(spec) is not None
+
+
 def _quantity(value: Any, unit: str, *, require_mapping_unit: bool = True) -> float:
-    """Parse a finite nonnegative quantity; bare numbers use canonical V/A units."""
+    """Parse a finite nonnegative quantity; bare numbers use the requested canonical unit."""
     if isinstance(value, bool):
         raise ValueError("boolean is not a numeric safety limit")
     supplied_unit = None
@@ -109,12 +157,9 @@ def run_safety_checks(config: Mapping[str, Any], *, instruments: Mapping[str, In
         configured = set(spec.get("checks") or [])
         safety = dict(spec.get("safety") or {})
         adapter = _adapter_for(name, instruments)
-        is_energy_source = bool(
-            safety.get("energy_source")
-            or safety.get("is_energy_source")
-            or spec.get("energy_source")
-            or spec.get("is_energy_source")
-        )
+        control_kind = energy_control_kind(spec)
+        source = control_kind == "source"
+        load = control_kind == "load"
 
         if "calibration_date" in configured or safety.get("calibration_due"):
             if safety.get("calibration_due"):
@@ -126,45 +171,49 @@ def run_safety_checks(config: Mapping[str, Any], *, instruments: Mapping[str, In
             else:
                 checks.append(result("calibration_date", "safety", "fail", f"{name}: calibration due date not documented."))
 
-        channel_specs = safety.get("channels") if is_energy_source else None
+        channel_specs = safety.get("channels") if source else None
         if not isinstance(channel_specs, list):
             channel_specs = [safety]
         for channel_spec in channel_specs:
             if not isinstance(channel_spec, Mapping):
-                continue  # validate_config reports malformed energy-source channel records.
+                continue  # validate_config reports malformed energy-controller records.
             channel = str(channel_spec.get("channel", "")).strip()
             evidence_prefix = f"{name} {channel}".strip()
-            must_verify_output = "output_disabled_on_start" in configured or is_energy_source
-            if must_verify_output:
-                query = channel_spec.get("output_query") or (
-                    None if is_energy_source else spec.get("output_query")
+            must_verify_state = "output_disabled_on_start" in configured or source or load
+            if must_verify_state:
+                state_field = "input_query" if load else "output_query"
+                result_name = "input_disabled_on_start" if load else "output_disabled_on_start"
+                state_label = "load input" if load else "energy-source output"
+                query = channel_spec.get(state_field) or (
+                    None if control_kind else spec.get(state_field)
                 )
                 if adapter is None or not query:
                     checks.append(result(
-                        "output_disabled_on_start", "safety", "fail",
-                        f"{evidence_prefix}: energy-source output state is missing or unverifiable.",
+                        result_name, "safety", "fail",
+                        f"{evidence_prefix}: {state_label} state is missing or unverifiable.",
                         severity="high", evidence={"channel": channel},
                     ))
                 else:
                     try:
-                        trusted_query = _validated_query(query, "output_query")
+                        trusted_query = _validated_query(query, state_field)
                         response = adapter.query(trusted_query).strip()
                         status = "pass" if _off(response) else "fail"
                         checks.append(result(
-                            "output_disabled_on_start", "safety", status,
+                            result_name, "safety", status,
                             f"{evidence_prefix}: {trusted_query} returned {response}.",
                             severity="high",
                             evidence={"channel": channel, "query": trusted_query, "response": response},
                         ))
                     except Exception as exc:  # noqa: BLE001
                         checks.append(result(
-                            "output_disabled_on_start", "safety", "fail",
-                            f"{evidence_prefix}: output-state readback failed: {exc}", severity="high",
+                            result_name, "safety", "fail",
+                            f"{evidence_prefix}: {state_label}-state readback failed: {exc}", severity="high",
                             evidence={"channel": channel, "query": query},
                         ))
 
-            for key, unit in _UNITS.items():
-                if key not in configured and not is_energy_source:
+            units = _LOAD_UNITS if load else _SOURCE_UNITS
+            for key, unit in units.items():
+                if key not in configured and control_kind is None:
                     continue
                 if key not in channel_spec:
                     checks.append(result(
@@ -178,7 +227,7 @@ def run_safety_checks(config: Mapping[str, Any], *, instruments: Mapping[str, In
                     query_key = key.removesuffix("_limit") + "_query"
                     setpoint_key = key.removesuffix("_limit") + "_setpoint"
                     if not channel_spec.get(query_key):
-                        if is_energy_source:
+                        if control_kind is not None:
                             raise ValueError(f"trusted live {query_key} readback evidence is required")
                         if setpoint_key in channel_spec:
                             actual = _quantity(channel_spec[setpoint_key], unit, require_mapping_unit=False)
