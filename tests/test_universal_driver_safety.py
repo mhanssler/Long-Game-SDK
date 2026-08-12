@@ -203,6 +203,62 @@ def test_armed_write_rechecks_identity_instead_of_using_cached_verification(tmp_
     assert instrument.writes == []
 
 
+@pytest.mark.parametrize(
+    "live_idn",
+    [
+        "ACME,SAFE-1,sn1,1.0",
+        "\tACME,SAFE-1,SN1,1.0",
+        "ACME,SAFE\x00-1,SN1,1.0",
+        "ACME,SAFE-1,SN\x001,1.0",
+    ],
+)
+def test_live_identity_controls_and_serial_case_mismatch_never_authorize_write(
+    tmp_path: Path, live_idn: str
+) -> None:
+    instrument = FakeInstrument()
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+    driver = UniversalDriver(
+        "mock", path, instrument=instrument, trusted_schema=True,
+        expected_identity=bound_identity(),
+    )
+    instrument.idn = live_idn
+
+    with driver.armed(), pytest.raises(MutationSafetyError, match="identity"):
+        driver.set_voltage(channel=1, value=1.0)
+
+    assert instrument.writes == []
+
+
+@pytest.mark.parametrize("serial", ["\tSN1", "SN\x001", "SN1\x7f"])
+def test_configured_identity_controls_are_rejected_without_writes(
+    tmp_path: Path, serial: str
+) -> None:
+    instrument = FakeInstrument()
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+
+    with pytest.raises(ValueError, match="control"):
+        UniversalDriver(
+            "mock", path, instrument=instrument, trusted_schema=True,
+            expected_identity={"manufacturer": "ACME", "model": "SAFE-1", "serial": serial},
+        )
+
+    assert instrument.writes == []
+
+
+def test_write_identity_allows_spaces_and_vendor_model_case_with_exact_serial(tmp_path: Path) -> None:
+    instrument = FakeInstrument(idn="  acme  ,  safe-1  ,  SN1  ,1.0")
+    path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
+    driver = UniversalDriver(
+        "mock", path, instrument=instrument, trusted_schema=True,
+        expected_identity={"manufacturer": " ACME ", "model": " SAFE-1 ", "serial": " SN1 "},
+    )
+
+    with driver.armed():
+        driver.set_voltage(channel=1, value=1.0)
+
+    assert instrument.writes == [":SOURce1:VOLTage 1.000"]
+
+
 def test_armed_write_rejects_replaced_instrument_object(tmp_path: Path) -> None:
     original = FakeInstrument()
     replacement = FakeInstrument()

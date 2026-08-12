@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import pytest
 
+from long_game_sdk.sdk.preflight import checks as preflight_checks
 from long_game_sdk.sdk.preflight import instrument_checks
 from long_game_sdk.sdk.preflight.checks import PreflightConfigError, run_preflight
+from long_game_sdk.sdk.preflight.instrument_checks import (
+    InstrumentCheckOutcome,
+    ParsedLiveIdentity,
+)
 from long_game_sdk.sdk.preflight.report import render_markdown
-from long_game_sdk.sdk.preflight.safety_checks import is_energy_controlling, is_energy_source
+from long_game_sdk.sdk.preflight.safety_checks import (
+    is_energy_controlling,
+    is_energy_source,
+    run_safety_checks,
+)
 
 
 class FakeInstrument:
@@ -20,6 +29,20 @@ class FakeInstrument:
 
     def close(self) -> None:
         return None
+
+
+class TrackingInstrument(FakeInstrument):
+    def __init__(self, responses: dict[str, str]):
+        super().__init__(responses)
+        self.queries: list[str] = []
+        self.close_count = 0
+
+    def query(self, command: str) -> str:
+        self.queries.append(command)
+        return super().query(command)
+
+    def close(self) -> None:
+        self.close_count += 1
 
 
 def _safety_config(safety: dict, checks: list[str] | None = None):
@@ -105,6 +128,178 @@ def _valid_dl3021_safety(**overrides):
     return safety
 
 
+def _unbound_config(expected_manufacturer: str | None = None):
+    spec = {"name": "discovered", "checks": ["identity"], "safety": {}}
+    if expected_manufacturer is not None:
+        spec["expected_manufacturer"] = expected_manufacturer
+    return {"rig": {"instruments": [spec]}, "runtime": {}}
+
+
+@pytest.mark.parametrize(
+    ("idn", "expected_safety_names"),
+    [
+        ("RIGOL,DP832,DP8-001,1.0", {"output_disabled_on_start", "voltage_limit", "current_limit"}),
+        ("RIGOL,DL3021,DL3-001,1.0", {"input_disabled_on_start", "voltage_limit", "current_limit", "power_limit"}),
+    ],
+)
+@pytest.mark.parametrize("expected_manufacturer", [None, "RIGOL"])
+def test_live_known_energy_controller_requires_complete_binding_and_model_evidence(
+    tmp_path, idn, expected_safety_names, expected_manufacturer
+) -> None:
+    adapter = TrackingInstrument({"*IDN?": idn})
+
+    report = run_preflight(
+        _unbound_config(expected_manufacturer),
+        instruments={"discovered": adapter},
+        env={},
+        repo=tmp_path,
+    )
+
+    assert not report.ready
+    binding = next(item for item in report.results if item.name == "energy_controller_binding")
+    assert binding.status == "fail"
+    assert binding.severity == "high"
+    assert "expected_manufacturer" in binding.message or "expected_model" in binding.message
+    safety_failures = {
+        item.name for item in report.results if item.category == "safety" and item.status == "fail"
+    }
+    assert safety_failures >= expected_safety_names
+    assert adapter.queries == ["*IDN?"]
+    assert adapter.close_count == 0
+
+
+def test_malformed_live_idn_is_high_severity_failure_and_not_ready(tmp_path) -> None:
+    adapter = TrackingInstrument({"*IDN?": "RIGOL,DP832"})
+
+    report = run_preflight(
+        _unbound_config(), instruments={"discovered": adapter}, env={}, repo=tmp_path
+    )
+
+    assert not report.ready
+    identity = next(item for item in report.results if item.name == "identity")
+    assert identity.status == "fail"
+    assert identity.severity == "high"
+    assert "malformed" in identity.message.lower()
+    assert adapter.queries == ["*IDN?"]
+    assert adapter.close_count == 0
+
+
+@pytest.mark.parametrize(
+    "idn",
+    [
+        "ACME\nEVIL,SCOPE-1,SN-9,1.0",
+        "ACME,SCOPE\r1,SN-9,1.0",
+        "ACME,SCOPE-1,SN\x009,1.0",
+        "ACME,SCOPE-1,SN-9,1.0\x1fEVIL",
+    ],
+)
+def test_control_characters_anywhere_in_live_idn_fail_closed(tmp_path, idn) -> None:
+    adapter = TrackingInstrument({"*IDN?": idn})
+
+    report = run_preflight(
+        _unbound_config(), instruments={"discovered": adapter}, env={}, repo=tmp_path
+    )
+
+    assert not report.ready
+    identity = next(item for item in report.results if item.name == "identity")
+    assert identity.status == "fail"
+    assert identity.severity == "high"
+    assert "malformed" in identity.message.lower()
+    assert not any(item.name == "identity" and item.status == "warn" for item in report.results)
+
+
+def test_instrument_check_outcome_live_identities_are_immutable_snapshot() -> None:
+    identity = ParsedLiveIdentity.parse("ACME,SCOPE-1,SN-9,1.0")
+    source = {"scope": identity}
+
+    outcome = InstrumentCheckOutcome((), source)
+    source["replacement"] = identity
+
+    assert dict(outcome.live_identities) == {"scope": identity}
+    with pytest.raises(TypeError):
+        outcome.live_identities["replacement"] = identity  # type: ignore[index]
+
+
+def test_live_idn_query_failure_is_high_severity_and_not_ready(tmp_path) -> None:
+    class FailingIdentityInstrument(TrackingInstrument):
+        def query(self, command: str) -> str:
+            self.queries.append(command)
+            raise TimeoutError("IDN timeout")
+
+    adapter = FailingIdentityInstrument({})
+
+    report = run_preflight(
+        _unbound_config(), instruments={"discovered": adapter}, env={}, repo=tmp_path
+    )
+
+    assert not report.ready
+    reachable = next(item for item in report.results if item.name == "instrument_reachable")
+    assert reachable.status == "fail"
+    assert reachable.severity == "high"
+    assert "IDN timeout" in reachable.message
+    assert adapter.queries == ["*IDN?"]
+    assert adapter.close_count == 0
+
+
+def test_unknown_live_device_preserves_nonblocking_unconfigured_identity_semantics(tmp_path) -> None:
+    adapter = TrackingInstrument({"*IDN?": "ACME,SCOPE-1,SN-9,1.0"})
+
+    report = run_preflight(
+        _unbound_config(), instruments={"discovered": adapter}, env={}, repo=tmp_path
+    )
+
+    assert report.ready
+    assert any(item.name == "identity" and item.status == "warn" for item in report.results)
+    assert not any(item.name == "energy_controller_binding" for item in report.results)
+    assert adapter.queries == ["*IDN?"]
+    assert adapter.close_count == 0
+
+
+@pytest.mark.parametrize(
+    ("config", "name", "responses"),
+    [
+        (
+            _safety_config(_valid_dp832_safety(), checks=["identity"]),
+            "main_psu",
+            {
+                "*IDN?": "RIGOL,DP832,SN1,1",
+                **{
+                    command: response
+                    for channel in (1, 2, 3)
+                    for command, response in (
+                        (f":OUTPut? CH{channel}", "OFF"),
+                        (f":SOURce{channel}:VOLTage?", "0 V"),
+                        (f":SOURce{channel}:CURRent?", "0 A"),
+                    )
+                },
+            },
+        ),
+        (
+            _dl3021_config(_valid_dl3021_safety()),
+            "electronic_load",
+            {
+                "*IDN?": "RIGOL,DL3021,DL3-123,1",
+                ":INPut?": "OFF",
+                ":MEASure:VOLTage?": "0 V",
+                ":MEASure:CURRent?": "0 A",
+                ":MEASure:POWer?": "0 W",
+            },
+        ),
+    ],
+)
+def test_complete_live_known_controller_safe_path_queries_idn_once_and_reuses_adapter(
+    tmp_path, config, name, responses
+) -> None:
+    adapter = TrackingInstrument(responses)
+
+    report = run_preflight(config, instruments={name: adapter}, env={}, repo=tmp_path)
+
+    assert report.ready
+    assert adapter.queries.count("*IDN?") == 1
+    assert len(adapter.queries) > 1
+    assert adapter.close_count == 0
+
+
 @pytest.mark.parametrize(
     "config",
     [
@@ -170,6 +365,283 @@ def test_energy_source_requires_exact_expected_identity_fields() -> None:
         config["rig"]["instruments"][0].pop(missing)
         with pytest.raises(PreflightConfigError, match=missing):
             run_preflight(config, instruments={})
+
+
+@pytest.mark.parametrize(
+    ("config", "missing"),
+    [
+        (_safety_config({}, checks=["identity"]), "expected_manufacturer"),
+        (_dl3021_config(), "expected_serial"),
+    ],
+)
+def test_known_energy_controller_rejects_partial_identity(config, missing) -> None:
+    spec = config["rig"]["instruments"][0]
+    spec.pop(missing)
+
+    with pytest.raises(PreflightConfigError, match="partial expected identity"):
+        run_preflight(config, instruments={})
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_idn", "safety_error"),
+    [
+        (_safety_config({}, checks=["identity"]), "RIGOL,DP832,SN1,1", "safety.channels"),
+        (_dl3021_config(), "RIGOL,DL3021,DL3-123,1", "input-state, voltage, current, and power"),
+    ],
+)
+def test_known_energy_controller_expected_idn_alias_cannot_bypass_safety(
+    config, expected_idn, safety_error
+) -> None:
+    spec = config["rig"]["instruments"][0]
+    for field in ("expected_manufacturer", "expected_model", "expected_serial"):
+        spec.pop(field)
+    spec["expected_idn"] = expected_idn
+
+    with pytest.raises(PreflightConfigError, match=safety_error):
+        run_preflight(config, instruments={})
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_identity"),
+    [
+        (_safety_config(_valid_dp832_safety(), checks=["identity"]), "RIGOL,DP832,OTHER,1"),
+        (_dl3021_config(_valid_dl3021_safety()), "RIGOL,DL3021,OTHER,1"),
+    ],
+)
+def test_known_energy_controller_rejects_conflicting_expected_identity_alias(
+    config, expected_identity
+) -> None:
+    config["rig"]["instruments"][0]["expected_identity"] = expected_identity
+
+    with pytest.raises(PreflightConfigError, match="conflicting expected identity"):
+        run_preflight(config, instruments={})
+
+
+@pytest.mark.parametrize(
+    ("expected_idn", "extra"),
+    [
+        ("RIGOL,DP832,OTHER,1", {}),
+        ("RIGOL,DP832,SN1,1", {"expected_identity": "RIGOL,DP832,OTHER,1"}),
+    ],
+)
+def test_expected_idn_conflicts_fail_before_resource_access(
+    monkeypatch, expected_idn, extra
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(
+        instrument_checks,
+        "VisaInstrumentAdapter",
+        lambda resource: opened.append(resource),
+    )
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
+    spec = config["rig"]["instruments"][0]
+    spec.update({"connection": "USB::DP832", "expected_idn": expected_idn, **extra})
+
+    with pytest.raises(PreflightConfigError, match="conflicting expected identity"):
+        run_preflight(config)
+
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"expected_identity": "RIGOL,DP832,sn1,1"},
+        {
+            "expected_identity": "RIGOL,DP832,SN1,1",
+            "expected_idn": "rigol,dp832,sn1,1",
+        },
+    ],
+)
+def test_serial_case_only_identity_conflicts_fail_before_resource_access(
+    monkeypatch, updates
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(
+        instrument_checks,
+        "VisaInstrumentAdapter",
+        lambda resource: opened.append(resource),
+    )
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
+    config["rig"]["instruments"][0].update(
+        {"connection": "USB::DP832", **updates}
+    )
+
+    with pytest.raises(PreflightConfigError, match="conflicting expected identity"):
+        run_preflight(config)
+
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("live_idn", "expected_identity", "expected_status"),
+    [
+        ("acme,scope-1,SN1,1", "ACME,SCOPE-1,SN1,1", "pass"),
+        ("ACME,SCOPE-1,sn1,1", "ACME,SCOPE-1,SN1,1", "fail"),
+    ],
+)
+def test_full_identity_uses_case_insensitive_vendor_model_and_exact_serial(
+    tmp_path, live_idn, expected_identity, expected_status
+) -> None:
+    config = _unbound_config()
+    config["rig"]["instruments"][0]["expected_identity"] = expected_identity
+
+    report = run_preflight(
+        config,
+        instruments={"discovered": FakeInstrument({"*IDN?": live_idn})},
+        env={},
+        repo=tmp_path,
+    )
+
+    identity = next(item for item in report.results if item.name == "identity")
+    assert identity.status == expected_status
+
+
+@pytest.mark.parametrize(
+    ("live_idn", "expected_manufacturer", "expected_model", "expected_serial", "status"),
+    [
+        ("acme,scope-1,SN1,1", "ACME", "SCOPE-1", "SN1", "pass"),
+        ("ACME,SCOPE-1,sn1,1", "ACME", "SCOPE-1", "SN1", "fail"),
+    ],
+)
+def test_explicit_identity_fields_use_canonical_vendor_model_and_exact_serial(
+    tmp_path, live_idn, expected_manufacturer, expected_model, expected_serial, status
+) -> None:
+    config = _unbound_config()
+    config["rig"]["instruments"][0].update({
+        "expected_manufacturer": expected_manufacturer,
+        "expected_model": expected_model,
+        "expected_serial": expected_serial,
+    })
+
+    report = run_preflight(
+        config,
+        instruments={"discovered": FakeInstrument({"*IDN?": live_idn})},
+        env={},
+        repo=tmp_path,
+    )
+
+    identity = next(item for item in report.results if item.name == "identity")
+    assert identity.status == status
+
+
+@pytest.mark.parametrize("expected_idn", ["RIGOL,DL3021", 3021])
+def test_malformed_expected_idn_fails_before_resource_access(monkeypatch, expected_idn) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(
+        instrument_checks,
+        "VisaInstrumentAdapter",
+        lambda resource: opened.append(resource),
+    )
+    config = _dl3021_config(_valid_dl3021_safety())
+    spec = config["rig"]["instruments"][0]
+    for field in ("expected_manufacturer", "expected_model", "expected_serial"):
+        spec.pop(field)
+    spec.update({"connection": "USB::DL3021", "expected_idn": expected_idn})
+
+    with pytest.raises(PreflightConfigError, match="full IDN|string|manufacturer, model, and serial"):
+        run_preflight(config)
+
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("field", "valid_value"),
+    [
+        ("expected_identity", "ACME,SCOPE-1,SN1,1"),
+        ("expected_idn", "ACME,SCOPE-1,SN1,1"),
+        ("expected_manufacturer", "ACME"),
+        ("expected_model", "SCOPE-1"),
+        ("expected_serial", "SN1"),
+    ],
+)
+@pytest.mark.parametrize("control", [*(chr(code) for code in range(32)), "\x7f"])
+@pytest.mark.parametrize("edge", ["leading", "trailing"])
+def test_configured_identity_controls_are_rejected_before_resource_access(
+    monkeypatch, field, valid_value, control, edge
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(
+        instrument_checks,
+        "VisaInstrumentAdapter",
+        lambda resource: opened.append(resource),
+    )
+    configured_value = (
+        f"{control}{valid_value}" if edge == "leading" else f"{valid_value}{control}"
+    )
+    config = _unbound_config()
+    config["rig"]["instruments"][0].update({
+        "connection": "USB::SCOPE",
+        field: configured_value,
+    })
+
+    with pytest.raises(PreflightConfigError, match="control character"):
+        run_preflight(config)
+
+    assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("expected_serial", "binding_status"),
+    [("sn1", "fail"), ("SN1", None)],
+)
+def test_safety_runtime_binding_is_case_insensitive_except_for_serial(
+    expected_serial, binding_status
+) -> None:
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
+    spec = config["rig"]["instruments"][0]
+    spec.update({
+        "expected_manufacturer": "rigol",
+        "expected_model": "dp832",
+        "expected_serial": expected_serial,
+    })
+    live_identity = ParsedLiveIdentity.parse("RIGOL,DP832,SN1,1")
+
+    results = run_safety_checks(
+        config,
+        instruments={},
+        live_identities={"main_psu": live_identity},
+    )
+
+    binding = [item for item in results if item.name == "energy_controller_binding"]
+    if binding_status is None:
+        assert binding == []
+    else:
+        assert [item.status for item in binding] == [binding_status]
+        assert "expected_serial" in binding[0].message
+        assert "expected_manufacturer" not in binding[0].message
+        assert "expected_model" not in binding[0].message
+
+
+def test_expected_idn_is_canonicalized_for_downstream_identity_check(monkeypatch, tmp_path) -> None:
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        preflight_checks,
+        "run_instrument_checks",
+        lambda config, instruments: captured.append(config)
+        or instrument_checks.InstrumentCheckOutcome((), {}),
+    )
+    monkeypatch.setattr(
+        preflight_checks,
+        "run_safety_checks",
+        lambda config, instruments, live_identities: [],
+    )
+    config = _safety_config(_valid_dp832_safety(), checks=["identity"])
+    spec = config["rig"]["instruments"][0]
+    for field in ("expected_manufacturer", "expected_model", "expected_serial"):
+        spec.pop(field)
+    spec["expected_idn"] = " RIGOL, DP832, SN1, 1 "
+
+    run_preflight(config, instruments={}, env={}, repo=tmp_path)
+
+    downstream = captured[0]["rig"]["instruments"][0]
+    assert downstream["expected_identity"] == "RIGOL,DP832,SN1,1"
+    assert "expected_idn" not in downstream
+    assert (
+        downstream["expected_manufacturer"],
+        downstream["expected_model"],
+        downstream["expected_serial"],
+    ) == ("RIGOL", "DP832", "SN1")
 
 
 def test_dp832_energy_source_requires_explicit_live_evidence_for_all_channels() -> None:
@@ -325,7 +797,7 @@ def test_preflight_passes_with_fake_rigol_psu(tmp_path):
             "instruments": [
                 {
                     "name": "main_psu",
-                    "expected_model": "DP832",
+                    "expected_model": "GENERIC-PSU",
                     "checks": ["identity", "output_disabled_on_start", "voltage_limit", "current_limit", "calibration_date"],
                     "safety": {
                         "calibration_due": "2027-06-01",
@@ -342,7 +814,7 @@ def test_preflight_passes_with_fake_rigol_psu(tmp_path):
     }
     report = run_preflight(
         config,
-        instruments={"main_psu": FakeInstrument({"*IDN?": "RIGOL TECHNOLOGIES,DP832,123,1.0", ":OUTPut? CH1": "OFF"})},
+        instruments={"main_psu": FakeInstrument({"*IDN?": "RIGOL TECHNOLOGIES,GENERIC-PSU,123,1.0", ":OUTPut? CH1": "OFF"})},
         env={"LG_OPERATOR": "Morgan", "LG_DUT_SERIAL": "DUT-001"},
         repo=tmp_path,
     )
@@ -358,7 +830,7 @@ def test_preflight_fails_on_identity_mismatch(tmp_path):
         "rig": {
             "name": "bench-a",
             "dut_type": "pcba",
-            "instruments": [{"name": "main_psu", "expected_model": "DP832", "checks": ["identity"]}],
+            "instruments": [{"name": "main_psu", "expected_model": "MODEL832", "checks": ["identity"]}],
         },
         "runtime": {"output_dir": str(tmp_path)},
     }
@@ -372,19 +844,19 @@ def test_preflight_fails_on_identity_mismatch(tmp_path):
     assert not report.ready
     markdown = render_markdown(report)
     assert "NOT READY" in markdown
-    assert "expected DP832" in markdown
+    assert "expected MODEL832" in markdown
 
 
 def test_preflight_model_expectation_never_uses_idn_substring_matching(tmp_path):
     config = {
         "rig": {"instruments": [{
-            "name": "scope", "expected_model": "DP832", "checks": ["identity"],
+            "name": "scope", "expected_model": "MODEL832", "checks": ["identity"],
         }]},
         "runtime": {},
     }
     report = run_preflight(
         config,
-        instruments={"scope": FakeInstrument({"*IDN?": "ACME,NOT-DP832,DP832,1"})},
+        instruments={"scope": FakeInstrument({"*IDN?": "ACME,NOT-MODEL832,MODEL832,1"})},
         env={},
         repo=tmp_path,
     )
@@ -395,13 +867,13 @@ def test_preflight_model_expectation_never_uses_idn_substring_matching(tmp_path)
 def test_preflight_malformed_idn_cannot_satisfy_expected_identity(tmp_path):
     config = {
         "rig": {"instruments": [{
-            "name": "scope", "expected_model": "DP832", "checks": ["identity"],
+            "name": "scope", "expected_model": "MODEL832", "checks": ["identity"],
         }]},
         "runtime": {},
     }
     report = run_preflight(
         config,
-        instruments={"scope": FakeInstrument({"*IDN?": "DP832"})},
+        instruments={"scope": FakeInstrument({"*IDN?": "MODEL832"})},
         env={},
         repo=tmp_path,
     )

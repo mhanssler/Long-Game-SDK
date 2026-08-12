@@ -16,6 +16,8 @@ from typing import Any
 import pyvisa
 import yaml
 
+from long_game_sdk.sdk.identity import identities_equal, normalize_identity_value, parse_identity
+
 logger = logging.getLogger(__name__)
 
 _COMMAND_SEPARATORS = (";", "\n", "\r")
@@ -283,11 +285,12 @@ class UniversalDriver:
         if not isinstance(pattern, str) or not pattern:
             return False
         try:
-            response = str(instrument.query("*IDN?")).strip().replace("\x00", "")
+            response = str(instrument.query("*IDN?"))
             self.identity_response = response
             fields = self._parse_idn(response)
             self.identity_fields = fields
-            schema_matches = re.search(pattern, response, re.IGNORECASE) is not None
+            normalized_response = ",".join(fields) if fields is not None else response
+            schema_matches = re.search(pattern, normalized_response, re.IGNORECASE) is not None
             self.identity_verified = (
                 schema_matches
                 and fields is not None
@@ -300,10 +303,7 @@ class UniversalDriver:
 
     @staticmethod
     def _parse_idn(response: str) -> tuple[str, str, str] | None:
-        parts = tuple(part.strip() for part in response.split(","))
-        if len(parts) < 3 or any(not part for part in parts[:3]):
-            return None
-        return parts[0], parts[1], parts[2]
+        return parse_identity(response)
 
     @classmethod
     def _expected_identity_fields(
@@ -319,21 +319,20 @@ class UniversalDriver:
             if from_identity is None:
                 raise ValueError("expected_identity must contain manufacturer, model, and serial")
         elif isinstance(expected_identity, Mapping):
-            from_identity = (
-                str(expected_identity.get("manufacturer", "")).strip(),
-                str(expected_identity.get("model", "")).strip(),
-                str(expected_identity.get("serial", "")).strip(),
+            normalized_mapping = tuple(
+                normalize_identity_value(str(expected_identity.get(field, "")))
+                for field in ("manufacturer", "model", "serial")
             )
+            from_identity = normalized_mapping[0], normalized_mapping[1], normalized_mapping[2]
         elif expected_identity is None:
             from_identity = None
         else:
             raise TypeError("expected_identity must be a mapping, IDN string, or None")
 
-        explicit = (
-            (manufacturer or "").strip(),
-            (model or "").strip(),
-            (serial or "").strip(),
+        normalized_explicit = tuple(
+            normalize_identity_value(value or "") for value in (manufacturer, model, serial)
         )
+        explicit = normalized_explicit[0], normalized_explicit[1], normalized_explicit[2]
         if any(explicit):
             if not all(explicit):
                 raise ValueError(
@@ -352,9 +351,7 @@ class UniversalDriver:
     def _identities_equal(
         actual: tuple[str, str, str], expected: tuple[str, str, str]
     ) -> bool:
-        return tuple(value.casefold() for value in actual) == tuple(
-            value.casefold() for value in expected
-        )
+        return identities_equal(actual, expected)
 
     @contextmanager
     def armed(self) -> Iterator["UniversalDriver"]:

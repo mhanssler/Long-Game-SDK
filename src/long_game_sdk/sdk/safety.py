@@ -13,6 +13,12 @@ import yaml
 
 from long_game_sdk.sdk.discovery import discover_usb
 from long_game_sdk.sdk.drivers.labjack_u3 import LabJackDependencyError, LabJackU3Driver
+from long_game_sdk.sdk.identity import (
+    identities_equal,
+    identity_field_equal,
+    normalize_identity_value,
+    parse_identity,
+)
 
 SafeState = Literal["verified_safe", "unsafe", "unverifiable", "no_action_required"]
 
@@ -63,10 +69,7 @@ _DEFAULT_SAFE_CURRENT = 0.01
 
 
 def _parse_idn(idn: str) -> tuple[str, str, str] | None:
-    parts = tuple(part.strip() for part in idn.split(","))
-    if len(parts) < 3 or any(not part for part in parts[:3]):
-        return None
-    return parts[0], parts[1], parts[2]
+    return parse_identity(idn)
 
 
 def _model_from_idn(idn: str) -> str:
@@ -89,21 +92,22 @@ def _instrument_specs(config: Mapping[str, Any] | None) -> list[Mapping[str, Any
 
 
 def _expected_identity_fields(expected: Mapping[str, Any]) -> tuple[str, str, str] | None:
-    expected_idn = str(
-        expected.get("expected_identity") or expected.get("expected_idn") or ""
-    ).strip()
+    expected_idn = str(expected.get("expected_identity") or expected.get("expected_idn") or "")
     parsed_expected = _parse_idn(expected_idn) if expected_idn else None
-    explicit = (
-        str(expected.get("expected_manufacturer") or expected.get("manufacturer") or "").strip(),
-        str(expected.get("expected_model") or expected.get("model") or "").strip(),
-        str(expected.get("expected_serial") or expected.get("serial") or "").strip(),
-    )
+    try:
+        normalized_explicit = tuple(
+            normalize_identity_value(
+                str(expected.get(f"expected_{field}") or expected.get(field) or "")
+            )
+            for field in ("manufacturer", "model", "serial")
+        )
+    except ValueError:
+        return None
+    explicit = normalized_explicit[0], normalized_explicit[1], normalized_explicit[2]
     if any(explicit):
         if not all(explicit):
             return None
-        if parsed_expected is not None and tuple(value.casefold() for value in parsed_expected) != tuple(
-            value.casefold() for value in explicit
-        ):
+        if parsed_expected is not None and not identities_equal(parsed_expected, explicit):
             return None
         return explicit
     return parsed_expected
@@ -121,18 +125,24 @@ def _validate_identity_declarations(
     for declaration in declarations:
         for field in values:
             for key in (f"expected_{field}", field):
-                value = str(declaration.get(key) or "").strip()
+                raw_value = str(declaration.get(key) or "")
+                try:
+                    value = normalize_identity_value(raw_value)
+                except ValueError as error:
+                    raise SafeStateConfigError(
+                        f"{label} has invalid exact expected {field} identity: {error}"
+                    ) from error
                 if value:
-                    values[field].add(value.casefold())
+                    values[field].add(value if field == "serial" else value.casefold())
         for key in ("expected_identity", "expected_idn"):
-            identity = str(declaration.get(key) or "").strip()
+            identity = str(declaration.get(key) or "")
             if not identity:
                 continue
             parsed = _parse_idn(identity)
             if parsed is None:
                 raise SafeStateConfigError(f"{label} has malformed exact expected identity")
             for field, value in zip(values, parsed):
-                values[field].add(value.casefold())
+                values[field].add(value if field == "serial" else value.casefold())
     for field, declared_values in values.items():
         if len(declared_values) > 1:
             raise SafeStateConfigError(
@@ -271,23 +281,42 @@ def _identity_error(idn: str, expected: Mapping[str, Any]) -> str | None:
     if parsed is None:
         return f"malformed instrument identity: {idn}"
     manufacturer, model, serial = parsed
-    wanted_idn = str(expected.get("expected_identity") or expected.get("expected_idn") or "").strip()
-    wanted_manufacturer = str(
-        expected.get("expected_manufacturer") or expected.get("manufacturer") or ""
-    ).strip()
-    wanted_model = str(expected.get("expected_model") or expected.get("model") or "").strip()
-    wanted_serial = str(expected.get("expected_serial") or expected.get("serial") or "").strip()
-    if wanted_idn and wanted_idn.casefold() != idn.casefold():
-        return f"identity mismatch: expected {wanted_idn}; received {idn}"
-    if wanted_manufacturer and wanted_manufacturer.casefold() != manufacturer.casefold():
+    wanted = _expected_identity_fields(expected)
+    if wanted is None:
+        wanted_manufacturer = normalize_identity_value(
+            str(expected.get("expected_manufacturer") or expected.get("manufacturer") or "")
+        )
+        wanted_model = normalize_identity_value(
+            str(expected.get("expected_model") or expected.get("model") or "")
+        )
+        wanted_serial = normalize_identity_value(
+            str(expected.get("expected_serial") or expected.get("serial") or "")
+        )
+    else:
+        wanted_manufacturer, wanted_model, wanted_serial = wanted
+    if wanted_manufacturer and not identity_field_equal(
+        "manufacturer", wanted_manufacturer, manufacturer
+    ):
         return (
             f"identity mismatch: expected manufacturer {wanted_manufacturer}; "
             f"received {manufacturer}"
         )
-    if wanted_model and wanted_model.casefold() != model.casefold():
+    if wanted_model and not identity_field_equal("model", wanted_model, model):
         return f"identity mismatch: expected model {wanted_model}; received {model}"
-    if wanted_serial and wanted_serial.casefold() != serial.casefold():
+    if wanted_serial and not identity_field_equal("serial", wanted_serial, serial):
         return f"identity mismatch: expected serial {wanted_serial}; received {serial}"
+    return None
+
+
+def _authorize_visa_write(instrument: Any, expected: Mapping[str, Any]) -> str | None:
+    """Authorize one imminent write using a fresh query on its transport object."""
+    try:
+        fresh_idn = str(instrument.query("*IDN?"))
+    except Exception as exc:  # noqa: BLE001 - transport failures must fail closed
+        return f"pre-write identity query failed: {exc}"
+    mismatch = _identity_error(fresh_idn, expected)
+    if mismatch:
+        return f"pre-write authorization failed: {mismatch}"
     return None
 
 
@@ -384,7 +413,7 @@ def _apply_safe_state_with_manager(
         try:
             instrument = cast(Any, rm.open_resource(resource))
             instrument.timeout = 3000
-            idn = instrument.query("*IDN?").strip().replace("\x00", "")
+            idn = str(instrument.query("*IDN?"))
             model = _model_from_idn(idn)
             binding = bindings.get(resource, {})
             mismatch = _identity_error(idn, binding) if resource in bindings else None
@@ -398,17 +427,23 @@ def _apply_safe_state_with_manager(
                 errors.append(mismatch)
             else:
                 for command in SAFE_STATE_COMMANDS.get(model, ()):
+                    authorization_error = _authorize_visa_write(instrument, binding)
+                    if authorization_error:
+                        errors.append(f"{command}: {authorization_error}")
+                        break
                     try:
                         instrument.write(command)
                         actions.append(command)
                         time.sleep(0.1)
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"{command}: {exc}")
-                for query in SAFE_STATE_CHECKS.get(model, ()):
-                    try:
-                        checks.append((query, instrument.query(query).strip()))
-                    except Exception as exc:  # noqa: BLE001
-                        errors.append(f"{query}: {exc}")
+                        break
+                if not errors:
+                    for query in SAFE_STATE_CHECKS.get(model, ()):
+                        try:
+                            checks.append((query, instrument.query(query).strip()))
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"{query}: {exc}")
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
         finally:

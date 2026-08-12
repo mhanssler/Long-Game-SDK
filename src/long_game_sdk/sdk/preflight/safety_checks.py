@@ -6,7 +6,11 @@ import re
 from datetime import date, datetime
 from typing import Any, Mapping
 
-from long_game_sdk.sdk.preflight.instrument_checks import InstrumentAdapter
+from long_game_sdk.sdk.preflight.instrument_checks import (
+    InstrumentAdapter,
+    ParsedLiveIdentity,
+    identity_field_equal,
+)
 from long_game_sdk.sdk.preflight.results import result
 
 _SOURCE_UNITS = {"voltage_limit": "V", "current_limit": "A"}
@@ -44,24 +48,18 @@ def _adapter_for(name: str, instruments: Mapping[str, InstrumentAdapter] | None)
     return instruments.get(name) if instruments else None
 
 
-def _has_exact_identity(spec: Mapping[str, Any]) -> bool:
-    return all(
-        isinstance(value, str) and bool(value.strip())
-        for value in (
-            spec.get("expected_manufacturer"),
-            spec.get("expected_model"),
-            spec.get("expected_serial"),
-        )
-    )
-
-
 def energy_control_kind(spec: Mapping[str, Any]) -> str | None:
     """Return ``source`` or ``load`` for explicitly or intrinsically controlled energy."""
-    manufacturer = str(spec.get("expected_manufacturer", "")).strip().casefold()
     model = str(spec.get("expected_model", "")).strip().casefold()
-    if _has_exact_identity(spec) and model == "dp832":
+    if not model:
+        alias = spec.get("expected_identity")
+        if isinstance(alias, str):
+            parts = alias.split(",")
+            if len(parts) >= 2:
+                model = parts[1].strip().casefold()
+    if model == "dp832":
         return "source"
-    if _has_exact_identity(spec) and manufacturer == "rigol" and model == "dl3021":
+    if model == "dl3021":
         return "load"
     safety = spec.get("safety")
     if (
@@ -150,16 +148,70 @@ def _calibration_due(value: Any) -> date:
     return due
 
 
-def run_safety_checks(config: Mapping[str, Any], *, instruments: Mapping[str, InstrumentAdapter] | None = None):
+def run_safety_checks(
+    config: Mapping[str, Any], *, instruments: Mapping[str, InstrumentAdapter] | None = None,
+    live_identities: Mapping[str, ParsedLiveIdentity] | None = None,
+):
     checks = []
     for spec in _instrument_configs(config):
         name = str(spec.get("name", "unnamed_instrument"))
         configured = set(spec.get("checks") or [])
         safety = dict(spec.get("safety") or {})
         adapter = _adapter_for(name, instruments)
-        control_kind = energy_control_kind(spec)
+        live_identity = (live_identities or {}).get(name)
+        live_spec = {"expected_model": live_identity.model} if live_identity is not None else {}
+        live_control_kind = energy_control_kind(live_spec)
+        control_kind = live_control_kind or energy_control_kind(spec)
         source = control_kind == "source"
         load = control_kind == "load"
+
+        if live_identity is not None and live_control_kind is not None:
+            expected = {
+                field: str(spec.get(field, "")).strip()
+                for field in ("expected_manufacturer", "expected_model", "expected_serial")
+            }
+            actual_identity = {
+                "expected_manufacturer": live_identity.manufacturer,
+                "expected_model": live_identity.model,
+                "expected_serial": live_identity.serial,
+            }
+            missing = [field for field, value in expected.items() if not value]
+            mismatched = [
+                field for field, value in expected.items()
+                if value
+                and not identity_field_equal(
+                    field.removeprefix("expected_"), value, actual_identity[field]
+                )
+            ]
+            if missing or mismatched:
+                details = []
+                if missing:
+                    details.append(f"missing {', '.join(missing)}")
+                if mismatched:
+                    details.append(f"mismatched {', '.join(mismatched)}")
+                checks.append(result(
+                    "energy_controller_binding", "safety", "fail",
+                    f"{name}: live {live_identity.model} requires complete exact configured binding; "
+                    f"{'; '.join(details)}.", severity="high",
+                    evidence={"live_identity": live_identity.raw, **expected},
+                ))
+
+        policy_complete = True
+        if source:
+            channels = safety.get("channels")
+            policy_complete = isinstance(channels, list) and bool(channels)
+        elif load:
+            policy_complete = all(key in safety for key in (
+                "input_query", "voltage_limit", "voltage_query", "current_limit",
+                "current_query", "power_limit", "power_query",
+            ))
+        if control_kind is not None and not policy_complete:
+            checks.append(result(
+                "energy_controller_policy", "safety", "fail",
+                f"{name}: live {live_identity.model if live_identity else 'energy controller'} "
+                "is missing complete model-specific safety policy and live evidence.",
+                severity="high",
+            ))
 
         if "calibration_date" in configured or safety.get("calibration_due"):
             if safety.get("calibration_due"):

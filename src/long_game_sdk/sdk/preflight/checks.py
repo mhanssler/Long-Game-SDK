@@ -19,7 +19,14 @@ import yaml
 
 from long_game_sdk.sdk.preflight import instrument_checks
 from long_game_sdk.sdk.preflight.environment_checks import run_environment_checks
-from long_game_sdk.sdk.preflight.instrument_checks import InstrumentAdapter, run_instrument_checks
+from long_game_sdk.sdk.preflight.instrument_checks import (
+    InstrumentAdapter,
+    ParsedLiveIdentity,
+    identities_equal,
+    identity_field_equal,
+    normalized_identity_value,
+    run_instrument_checks,
+)
 from long_game_sdk.sdk.preflight.safety_checks import energy_control_kind, run_safety_checks
 
 SUPPORTED_CHECKS = frozenset({
@@ -34,6 +41,85 @@ SUPPORTED_CHECKS = frozenset({
 
 class PreflightConfigError(ValueError):
     """Raised before resource access when a preflight inventory is unsafe or malformed."""
+
+
+_IDENTITY_FIELDS = ("expected_manufacturer", "expected_model", "expected_serial")
+
+
+def _canonicalize_identity(raw_spec: Mapping[str, Any], name: str) -> dict[str, Any]:
+    """Return a copy with either full expected identity alias canonicalized and expanded."""
+    spec = dict(raw_spec)
+    for field_name in ("expected_identity", "expected_idn", *_IDENTITY_FIELDS):
+        value = spec.get(field_name)
+        if isinstance(value, str):
+            try:
+                spec[field_name] = normalized_identity_value(value)
+            except ValueError as exc:
+                raise PreflightConfigError(
+                    f"instrument {name!r} {field_name} contains a control character"
+                ) from exc
+    aliases: list[tuple[str, str, tuple[str, ...]]] = []
+    for alias_name in ("expected_identity", "expected_idn"):
+        alias = spec.get(alias_name)
+        if alias is None:
+            continue
+        if not isinstance(alias, str):
+            raise PreflightConfigError(
+                f"instrument {name!r} {alias_name} must be a full IDN string"
+            )
+        parts = tuple(part.strip() for part in alias.split(","))
+        if len(parts) < 3 or any(not part for part in parts[:3]):
+            raise PreflightConfigError(
+                f"instrument {name!r} {alias_name} must contain manufacturer, model, and serial"
+            )
+        aliases.append((alias_name, ",".join(parts), parts))
+
+    if aliases:
+        canonical_alias = aliases[0][1]
+        try:
+            canonical_identity = ParsedLiveIdentity.parse(canonical_alias)
+            aliases_conflict = any(
+                not identities_equal(canonical_identity, ParsedLiveIdentity.parse(alias))
+                for _, alias, _ in aliases[1:]
+            )
+        except ValueError as exc:
+            raise PreflightConfigError(f"instrument {name!r} has malformed expected identity") from exc
+        if aliases_conflict:
+            raise PreflightConfigError(
+                f"instrument {name!r} has conflicting expected identity declarations"
+            )
+        for field_name, alias_value in zip(_IDENTITY_FIELDS, aliases[0][2][:3], strict=True):
+            explicit = spec.get(field_name)
+            comparison_field = field_name.removeprefix("expected_")
+            if explicit is not None and (
+                not isinstance(explicit, str)
+                or not identity_field_equal(comparison_field, explicit, alias_value)
+            ):
+                raise PreflightConfigError(
+                    f"instrument {name!r} has conflicting expected identity declarations"
+                )
+            spec[field_name] = alias_value
+        spec["expected_identity"] = canonical_alias
+        spec.pop("expected_idn", None)
+    return spec
+
+
+def _normalized_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    rig = config.get("rig")
+    if not isinstance(rig, Mapping):
+        return normalized
+    normalized_rig = dict(rig)
+    inventory = rig.get("instruments")
+    if isinstance(inventory, list):
+        normalized_rig["instruments"] = [
+            _canonicalize_identity(item, str(item.get("name", "unnamed_instrument")))
+            if isinstance(item, Mapping)
+            else item
+            for item in inventory
+        ]
+    normalized["rig"] = normalized_rig
+    return normalized
 
 
 def _query_addresses_channel(query: str, channel: str, query_field: str) -> bool:
@@ -74,6 +160,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
     """Validate the complete inventory before any instrument resource is opened."""
     if not isinstance(config, Mapping):
         raise PreflightConfigError("preflight config must be a mapping")
+    config = _normalized_config(config)
     rig = config.get("rig")
     if not isinstance(rig, Mapping):
         raise PreflightConfigError("preflight config requires a rig mapping")
@@ -118,8 +205,21 @@ def validate_config(config: Mapping[str, Any]) -> None:
         if not isinstance(safety, Mapping):
             raise PreflightConfigError(f"instrument {name!r} safety must be a mapping")
         control_kind = energy_control_kind(raw_spec)
+        identity_values = [raw_spec.get(field_name) for field_name in _IDENTITY_FIELDS]
+        if control_kind is not None and any(identity_values) and not all(
+            isinstance(value, str) and value.strip() for value in identity_values
+        ):
+            missing_identity = [
+                field_name
+                for field_name, value in zip(_IDENTITY_FIELDS, identity_values, strict=True)
+                if not isinstance(value, str) or not value.strip()
+            ]
+            raise PreflightConfigError(
+                f"energy controller {name!r} has partial expected identity; "
+                f"missing {', '.join(missing_identity)}"
+            )
         if control_kind == "source":
-            for field_name in ("expected_manufacturer", "expected_model", "expected_serial"):
+            for field_name in _IDENTITY_FIELDS:
                 value = raw_spec.get(field_name)
                 if not isinstance(value, str) or not value.strip():
                     raise PreflightConfigError(f"energy source {name!r} requires exact {field_name}")
@@ -259,6 +359,7 @@ def run_preflight(
 ) -> PreflightReport:
     """Run all configured preflight checks and return a structured report."""
 
+    config = _normalized_config(config)
     validate_config(config)
     rig = dict(config.get("rig") or {})
     runtime = dict(config.get("runtime") or {})
@@ -317,8 +418,13 @@ def run_preflight(
             )
 
         results.extend(run_environment_checks(config, env=environment, repo=repo, git_commit=git_commit))
-        results.extend(run_instrument_checks(config, instruments=active_instruments))
-        results.extend(run_safety_checks(config, instruments=active_instruments))
+        instrument_outcome = run_instrument_checks(config, instruments=active_instruments)
+        results.extend(instrument_outcome.results)
+        results.extend(run_safety_checks(
+            config,
+            instruments=active_instruments,
+            live_identities=instrument_outcome.live_identities,
+        ))
     finally:
         for owned_adapter in reversed(owned_adapters):
             try:

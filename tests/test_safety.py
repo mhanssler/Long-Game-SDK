@@ -29,6 +29,28 @@ class FakeInstrument:
     def close(self): pass
 
 
+class SequencedIdentityInstrument(FakeInstrument):
+    """VISA fake whose identity can change between safe-state mutations."""
+
+    def __init__(self, identities, responses=None):
+        super().__init__(responses or {})
+        self.identities = iter(identities)
+        self.events = []
+
+    def query(self, command):
+        self.events.append(("query", command))
+        if command == "*IDN?":
+            value = next(self.identities)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        return super().query(command)
+
+    def write(self, command):
+        self.events.append(("write", command))
+        super().write(command)
+
+
 class FakeRM:
     def __init__(self, instruments): self.instruments = instruments
     def list_resources(self): return tuple(self.instruments)
@@ -217,6 +239,198 @@ def test_configured_identity_mismatch_performs_zero_model_specific_writes(monkey
 
     assert result.state == "unverifiable"
     assert instrument.writes == []
+
+
+def _expected_device(model, serial):
+    return {
+        "expected_manufacturer": "RIGOL",
+        "expected_model": model,
+        "expected_serial": serial,
+    }
+
+
+def test_dp832_identity_change_immediately_before_first_write_blocks_all_writes(monkeypatch):
+    resource = "USB::DP832"
+    good = "RIGOL,DP832,SN1,1"
+    instrument = SequencedIdentityInstrument([good, "RIGOL,DP832,ATTACKER,1"])
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DP832", "SN1")}
+    )[0]
+
+    assert instrument.events == [("query", "*IDN?"), ("query", "*IDN?")]
+    assert instrument.writes == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+    assert any("identity mismatch" in error for error in result.errors)
+
+
+def test_dp832_identity_change_between_writes_blocks_current_and_subsequent_writes(monkeypatch):
+    resource = "USB::DP832"
+    good = "RIGOL,DP832,SN1,1"
+    instrument = SequencedIdentityInstrument([good, good, "RIGOL,DP832,sn1,1"])
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DP832", "SN1")}
+    )[0]
+
+    assert instrument.events == [
+        ("query", "*IDN?"),
+        ("query", "*IDN?"),
+        ("write", ":OUTPut CH1,OFF"),
+        ("query", "*IDN?"),
+    ]
+    assert instrument.writes == [":OUTPut CH1,OFF"]
+    assert result.actions == (":OUTPut CH1,OFF",)
+    assert result.state == "unverifiable"
+
+
+def test_dl3021_identity_change_immediately_before_write_blocks_write(monkeypatch):
+    resource = "USB::DL3021"
+    good = "RIGOL,DL3021,SN1,1"
+    instrument = SequencedIdentityInstrument([good, "RIGOL,DL3021,ATTACKER,1"])
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DL3021", "SN1")}
+    )[0]
+
+    assert instrument.events == [("query", "*IDN?"), ("query", "*IDN?")]
+    assert instrument.writes == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+
+
+@pytest.mark.parametrize(
+    "fresh_identity",
+    [OSError("fresh identity query failed"), "RIGOL,DP832\x00,SN1,1", "RIGOL,DP832"],
+    ids=["query-failure", "control-character", "malformed"],
+)
+def test_dp832_invalid_fresh_identity_immediately_before_write_blocks_all_writes(
+    monkeypatch, fresh_identity
+):
+    resource = "USB::DP832"
+    instrument = SequencedIdentityInstrument(["RIGOL,DP832,SN1,1", fresh_identity])
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DP832", "SN1")}
+    )[0]
+
+    assert instrument.events == [("query", "*IDN?"), ("query", "*IDN?")]
+    assert instrument.writes == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+
+
+@pytest.mark.parametrize(
+    "fresh_identity",
+    [OSError("fresh identity query failed"), "RIGOL,DL3021\x00,SN1,1", "RIGOL,DL3021"],
+    ids=["query-failure", "control-character", "malformed"],
+)
+def test_dl3021_invalid_fresh_identity_immediately_before_write_blocks_write(
+    monkeypatch, fresh_identity
+):
+    resource = "USB::DL3021"
+    instrument = SequencedIdentityInstrument(["RIGOL,DL3021,SN1,1", fresh_identity])
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DL3021", "SN1")}
+    )[0]
+
+    assert instrument.events == [("query", "*IDN?"), ("query", "*IDN?")]
+    assert instrument.writes == []
+    assert result.actions == ()
+    assert result.state == "unverifiable"
+
+
+def test_pre_write_authorization_and_write_remain_bound_to_opened_transport(monkeypatch):
+    resource = "USB::DP832"
+    good = "RIGOL,DP832,SN1,1"
+    readbacks = {
+        ":OUTPut? CH1": "OFF", ":OUTPut? CH2": "OFF", ":OUTPut? CH3": "OFF",
+        ":MEASure:VOLTage? CH1": "0", ":MEASure:VOLTage? CH2": "0",
+        ":MEASure:VOLTage? CH3": "0", ":MEASure:CURRent? CH1": "0",
+        ":MEASure:CURRent? CH2": "0", ":MEASure:CURRent? CH3": "0",
+    }
+    attacker = FakeInstrument({"*IDN?": "RIGOL,DP832,ATTACKER,1"})
+
+    class SubstitutionAttemptInstrument(SequencedIdentityInstrument):
+        def query(self, command):
+            response = super().query(command)
+            if command == "*IDN?":
+                manager.instruments[resource] = attacker
+            return response
+
+    opened = SubstitutionAttemptInstrument([good, good, good, good], readbacks)
+    instruments: dict[str, FakeInstrument] = {resource: opened}
+    manager = FakeRM(instruments)
+    monkeypatch.setattr(safety.pyvisa, "ResourceManager", lambda *_: manager)
+    monkeypatch.setattr(safety.time, "sleep", lambda *_: None)
+
+    result = safety.apply_safe_state(
+        expected_devices={resource: _expected_device("DP832", "SN1")}
+    )[0]
+
+    assert opened.writes == list(safety.SAFE_STATE_COMMANDS["DP832"])
+    assert attacker.writes == []
+    assert result.state == "verified_safe"
+
+
+@pytest.mark.parametrize(
+    ("expected", "live"),
+    [
+        ({"expected_serial": "sn1"}, "RIGOL,DP832,SN1,1"),
+        ({"expected_serial": "\tSN1"}, "RIGOL,DP832,SN1,1"),
+        ({"expected_serial": "SN\x00X"}, "RIGOL,DP832,SN\x00X,1"),
+        ({"expected_serial": "SN1"}, "\tRIGOL,DP832,SN1,1"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP\x00832,SN1,1"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN\x001,1"),
+    ],
+)
+def test_identity_controls_and_serial_case_mismatch_never_authorize_safe_state_writes(
+    monkeypatch, expected, live
+):
+    resource = "USB::DP832"
+    instrument = FakeInstrument({"*IDN?": live})
+    _patch_rm(monkeypatch, {resource: instrument})
+    binding = {
+        "expected_manufacturer": "RIGOL",
+        "expected_model": "DP832",
+        "expected_serial": "SN1",
+        **expected,
+    }
+
+    try:
+        result = safety.apply_safe_state(expected_devices={resource: binding})[0]
+        assert result.state == "unverifiable"
+    except safety.SafeStateConfigError:
+        pass
+
+    assert instrument.writes == []
+
+
+def test_safe_state_identity_allows_spaces_and_vendor_model_case_with_exact_serial(monkeypatch):
+    resource = "USB::DP832"
+    instrument = FakeInstrument({
+        "*IDN?": "  rigol  ,  dp832  ,  SN1  ,1",
+        ":OUTPut? CH1": "OFF", ":OUTPut? CH2": "OFF", ":OUTPut? CH3": "OFF",
+        ":MEASure:VOLTage? CH1": "0", ":MEASure:VOLTage? CH2": "0",
+        ":MEASure:VOLTage? CH3": "0", ":MEASure:CURRent? CH1": "0",
+        ":MEASure:CURRent? CH2": "0", ":MEASure:CURRent? CH3": "0",
+    })
+    _patch_rm(monkeypatch, {resource: instrument})
+
+    result = safety.apply_safe_state(expected_devices={resource: {
+        "expected_manufacturer": " RIGOL ", "expected_model": " DP832 ",
+        "expected_serial": " SN1 ",
+    }})[0]
+
+    assert result.state == "verified_safe"
+    assert instrument.writes == list(safety.SAFE_STATE_COMMANDS["DP832"])
 
 
 def test_configured_malformed_idn_performs_zero_model_specific_writes(monkeypatch):
