@@ -1,0 +1,6 @@
+# Generated local diagnostic cases are operational data, not source.
+*
+!.gitignore
+!examples/
+!examples/**
+!metadata.yaml

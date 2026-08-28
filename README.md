@@ -38,7 +38,14 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
    `lg-enrich` identifies discovered VISA/SCPI hardware, searches for likely programming/user manuals, caches the manual under `manuals/`, extracts SCPI-like commands, and merges them into the YAML schema without adding unsafe output-enabling behavior. `lg-auto-onboard` watches for newly detected VISA instruments and runs this onboard/enrichment path in-process; use `--once` for a single scan during setup or debugging.
 
-3. **Generate readiness, safety, and verification deliverables:**
+3. **Run bounded, read-only connectivity diagnosis:**
+   ```bash
+   uv run lg-diagnose --identity rigol_dp832 --resource 'TCPIP::192.168.1.50::INSTR' --symptom 'Cannot connect over Ethernet' -o reports/diagnostics/dp832-ethernet
+   ```
+
+   `lg-diagnose` uses a local model (`qwen3:8b` via Ollama by default) to select only fixed, read-only Tier0 probes. It has no free shell or mutating driver path: recommendations remain pending operator action, and v1 never changes instrument outputs, setpoints, or LAN settings. See [Diagnostic Troubleshooting](docs/diagnostic-troubleshooting.md) and the [reconstructed DP832 incident](examples/diagnostics/dp832_ethernet_incident.md).
+
+4. **Generate readiness, safety, and verification deliverables:**
    ```bash
    uv run lg-safe examples/lab_preflight_bench_a.yaml
    uv run lg-smoke examples/lab_preflight_bench_a.yaml
@@ -58,7 +65,7 @@ The Long Game Technologies SDK is a modern, Python-based framework designed for 
 
    With a bench/preflight config, `lg-safe` fails closed when declared equipment is absent or unbound; no-config mode is discovery-only and an empty scan is not evidence that an expected bench is safe. `lg-preflight` validates typed voltage/current limits, instrument identity, reachable setpoints, and source output state before execution. `lg-audit` converts readiness checks into a client-facing Diagnostic Audit. `lg-hv-safety-plan` generates HV/PCBA safety plans. `lg-bench-bom` produces setup reports, BOMs, harness maps, and bench YAML. `lg-schematic-import` converts curated pin maps, Altium CSVs, KiCad netlists, and text/PDF notes into canonical schematic context while rejecting conflicts, invalid ratings, empty extraction, and oversized inputs. `lg-flash-openocd` is dry-run only: it writes a proposed-command plan and refuses every live execution request pending a hardened sandbox. Its report is not evidence of target identity, flashing, or verification. `lg-guide-test` only renders approved, revision-matched connection records and never infers actionable wiring from net names. `lg-test-plan` generates traceable verification plans and optional pytest bundles.
 
-4. **Run the bus observer:**
+5. **Run the bus observer:**
    ```bash
    uv run python src/long_game_sdk/sdk/observers/auto_onboarder.py
    ```

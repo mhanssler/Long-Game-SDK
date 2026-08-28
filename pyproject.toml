@@ -38,6 +38,7 @@ lg-bench-bom = "long_game_sdk.sdk.bench_bom:main"
 lg-schematic-import = "long_game_sdk.sdk.schematic_import:main"
 lg-flash-openocd = "long_game_sdk.sdk.openocd_flash:main"
 lg-guide-test = "long_game_sdk.sdk.guided_test_setup:main"
+lg-diagnose = "long_game_sdk.sdk.diagnostic_engine:main"
 
 [build-system]
 requires = ["hatchling"]
