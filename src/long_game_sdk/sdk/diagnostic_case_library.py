@@ -34,6 +34,20 @@ _CASE_FIELDS = (
 _WORD = re.compile(r"[a-z0-9]+")
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry where directory file descriptors are supported."""
+
+    if os.name == "nt":
+        # Windows rejects opening directories through os.open(); the linked file
+        # itself has already been flushed and fsynced before publication.
+        return
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class _UniqueSafeLoader(yaml.SafeLoader):
     """Safe YAML loader that also rejects duplicate mapping keys."""
 
@@ -131,11 +145,7 @@ class DiagnosticCaseLibrary:
             except FileExistsError:
                 if self._safe_read(destination) != case:
                     raise FileExistsError("diagnostic case destination does not contain the canonical case") from None
-            directory_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(self.root)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)

@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 import yaml
 
+from long_game_sdk.sdk import diagnostic_case_library
 from long_game_sdk.sdk.diagnostic_case_library import DiagnosticCaseLibrary
 from long_game_sdk.sdk.diagnostic_engine import AskOperator, Conclude, DiagnosticEngine
 from long_game_sdk.sdk.diagnostic_session import DiagnosticSession, Finding, Hypothesis
@@ -280,3 +281,14 @@ def test_case_io_rejects_symlink_and_tampered_existing_destination(tmp_path: Pat
     with pytest.raises(FileExistsError):
         library.save(session)
     assert outside.read_text(encoding="utf-8") == "outside"
+
+
+def test_directory_fsync_is_skipped_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(diagnostic_case_library.os, "name", "nt")
+
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("Windows directory handles must not be opened with os.open")
+
+    monkeypatch.setattr(diagnostic_case_library.os, "open", unexpected_open)
+
+    diagnostic_case_library._fsync_directory(tmp_path)
