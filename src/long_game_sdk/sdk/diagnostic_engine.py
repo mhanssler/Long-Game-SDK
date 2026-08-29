@@ -816,6 +816,18 @@ def _write_json_event(stream: TextIO, event_type: str, data: Mapping[str, Any]) 
     stream.flush()
 
 
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry where directory file descriptors are supported."""
+
+    if os.name == "nt":
+        return
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 class _SafeBundleWriter:
     """No-follow report bundle writer with atomic final artifact replacement."""
 
@@ -855,11 +867,7 @@ class _SafeBundleWriter:
                 os.fsync(stream.fileno())
             self._destination(name)
             os.replace(temporary, destination)
-            directory_fd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(self.directory)
         finally:
             temporary.unlink(missing_ok=True)
 

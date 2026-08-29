@@ -34,6 +34,17 @@ def _events(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+def test_bundle_directory_fsync_is_skipped_on_windows(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(diagnostic_engine.os, "name", "nt")
+
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("Windows directory handles must not be opened with os.open")
+
+    monkeypatch.setattr(diagnostic_engine.os, "open", unexpected_open)
+
+    diagnostic_engine._fsync_directory(tmp_path)
+
+
 def test_cli_runs_interactively_and_writes_complete_report_bundle(
     tmp_path: Path, monkeypatch
 ) -> None:
