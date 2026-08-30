@@ -11,6 +11,7 @@ import ctypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class LabJackDependencyError(RuntimeError):
@@ -37,7 +38,10 @@ class LabJackU3Driver:
         if self.serial is not None:
             # Never let a safety operation attach to whichever U3 happens to be first.
             self.device = u3.U3(autoOpen=False)
-            self.device.open(serial=self.serial)
+            serial_locator = self.serial
+            if isinstance(serial_locator, str) and serial_locator.isdecimal():
+                serial_locator = int(serial_locator)
+            self.device.open(serial=serial_locator)
         else:
             self.device = u3.U3(autoOpen=self.auto_open)
         try:
@@ -48,6 +52,64 @@ class LabJackU3Driver:
 
     def read_ain(self, channel: int) -> float:
         return float(self.device.getAIN(channel))
+
+    def _read_config(self) -> dict[str, Any]:
+        config = self.device.configU3()
+        if not isinstance(config, dict):
+            raise RuntimeError("LabJack U3 returned an invalid configuration snapshot")
+        return config
+
+    def read_identity(self) -> tuple[str, str, str]:
+        """Read immutable physical identity from the currently opened U3."""
+
+        config = self._read_config()
+        model_value = config.get("DeviceName")
+        serial_value = config.get("SerialNumber")
+        if model_value is None or serial_value is None:
+            raise RuntimeError("LabJack U3 identity is incomplete")
+        model = str(model_value)
+        serial = str(serial_value)
+        if not model or not serial:
+            raise RuntimeError("LabJack U3 identity is incomplete")
+        return "LabJack", model, serial
+
+    def read_dac_volts(self) -> tuple[float, float]:
+        """Read the live calibrated DAC output registers in volts."""
+
+        try:
+            return float(self.device.readRegister(5000)), float(self.device.readRegister(5002))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("LabJack U3 DAC readback is unavailable") from exc
+
+    def read_io_config(self) -> tuple[int, int, int, int, bool, bool]:
+        """Read live port directions plus current timer/counter enables."""
+
+        try:
+            feedback = self.device.getFeedback(self._u3.PortDirRead())
+            io_config = self.device.configIO()
+            if (
+                not isinstance(feedback, list)
+                or len(feedback) != 1
+                or not isinstance(feedback[0], dict)
+                or not isinstance(io_config, dict)
+            ):
+                raise TypeError("invalid LabJack U3 live IO response")
+            directions = feedback[0]
+            fio = directions["FIO"]
+            eio = directions["EIO"]
+            cio = directions["CIO"]
+            timers = io_config["NumberOfTimersEnabled"]
+            counter0 = io_config["EnableCounter0"]
+            counter1 = io_config["EnableCounter1"]
+            if any(type(value) is not int for value in (fio, eio, cio, timers)):
+                raise TypeError("invalid LabJack U3 direction or timer value")
+            if not isinstance(counter0, bool) or not isinstance(counter1, bool):
+                raise TypeError("invalid LabJack U3 counter state")
+            if any(value < 0 for value in (fio, eio, cio, timers)):
+                raise ValueError("negative LabJack U3 IO state")
+            return fio, eio, cio, timers, counter0, counter1
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("LabJack U3 live digital-output state is unavailable") from exc
 
     def set_dac(self, channel: int, volts: float) -> None:
         if channel not in (0, 1):

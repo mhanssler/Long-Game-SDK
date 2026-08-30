@@ -389,6 +389,11 @@ def test_pre_write_authorization_and_write_remain_bound_to_opened_transport(monk
         ({"expected_serial": "SN1"}, "\tRIGOL,DP832,SN1,1"),
         ({"expected_serial": "SN1"}, "RIGOL,DP\x00832,SN1,1"),
         ({"expected_serial": "SN1"}, "RIGOL,DP832,SN\x001,1"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN1,1\n\n"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN1,1\r\n\r\n"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN1\n,1"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN1\u0085,1"),
+        ({"expected_serial": "SN1"}, "RIGOL,DP832,SN1\u2028,1"),
     ],
 )
 def test_identity_controls_and_serial_case_mismatch_never_authorize_safe_state_writes(
@@ -416,7 +421,7 @@ def test_identity_controls_and_serial_case_mismatch_never_authorize_safe_state_w
 def test_safe_state_identity_allows_spaces_and_vendor_model_case_with_exact_serial(monkeypatch):
     resource = "USB::DP832"
     instrument = FakeInstrument({
-        "*IDN?": "  rigol  ,  dp832  ,  SN1  ,1",
+        "*IDN?": "  rigol  ,  dp832  ,  SN1  ,1\r\n",
         ":OUTPut? CH1": "OFF", ":OUTPut? CH2": "OFF", ":OUTPut? CH3": "OFF",
         ":MEASure:VOLTage? CH1": "0", ":MEASure:VOLTage? CH2": "0",
         ":MEASure:VOLTage? CH3": "0", ":MEASure:CURRent? CH1": "0",
@@ -741,33 +746,190 @@ def test_unbound_supported_source_is_not_written_when_inventory_is_configured(mo
     assert source.writes == []
 
 
-def test_labjack_acknowledged_dac_writes_are_unverifiable_without_dac_readback(monkeypatch):
-    identity = InstrumentIdentity(transport="usb", resource="USB::u3", model="U3", serial="470012345",
-                                  idn="LabJack,U3,470012345", vendor_id="0cd5", product_id="0003")
+def test_labjack_dac_writes_require_fresh_identity_and_zero_readback(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3-HV",
+        serial="470012345", idn="LabJack,U3-HV,470012345", vendor_id="0cd5", product_id="0003",
+    )
     monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
-    seen = []
-    ain_reads = []
+    events = []
+
     class Driver:
-        def __init__(self, *, serial): seen.append(serial)
-        def safe_state(self): pass
-        def read_ain(self, channel):
-            ain_reads.append(channel)
-            return 0.0
-        def close(self): pass
+        def __init__(self, *, serial):
+            events.append(("open", str(serial)))
+
+        def read_identity(self):
+            events.append(("identity",))
+            return "LabJack", "U3-HV", "470012345"
+
+        def set_dac(self, channel, volts):
+            events.append(("write", channel, volts))
+
+        def read_dac_volts(self):
+            events.append(("dac_readback",))
+            return 0.0001, 0.0002
+
+        def read_io_config(self):
+            events.append(("io_readback",))
+            return 0, 0, 0, 0, False, False
+
+        def close(self):
+            events.append(("close",))
+
     monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
     config = {"rig": {"instruments": [{
         "name": "daq", "connection": identity.resource,
-        "expected_manufacturer": "LabJack", "expected_model": "U3",
+        "expected_manufacturer": "LabJack", "expected_model": "U3-HV",
         "expected_serial": "470012345",
+        "safety": {"dac_safe_max_volts": 0.01},
     }]}}
+
     result = safety.apply_usb_safe_state(config=config)[0]
-    assert seen == ["470012345"]
-    assert ain_reads == []
+
+    assert events == [
+        ("open", "470012345"),
+        ("identity",), ("write", 0, 0.0),
+        ("identity",), ("write", 1, 0.0),
+        ("dac_readback",), ("io_readback",), ("close",),
+    ]
     assert result.actions == ("DAC0=0.0 V", "DAC1=0.0 V")
-    assert result.checks == ()
-    assert result.state == "unverifiable"
+    assert result.checks == (
+        ("DAC0 voltage", "0.0001 V"),
+        ("DAC1 voltage", "0.0002 V"),
+        ("FIO direction mask", "0"),
+        ("EIO direction mask", "0"),
+        ("CIO direction mask", "0"),
+        ("timers enabled", "0"),
+        ("counter 0 enabled", "False"),
+        ("counter 1 enabled", "False"),
+    )
+    assert result.state == "verified_safe"
+    assert result.safe
+
+
+def test_labjack_nonzero_dac_readback_is_unsafe(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3-HV",
+        serial="470012345", idn="LabJack,U3-HV,470012345", vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+
+    class Driver:
+        def __init__(self, *, serial): pass
+        def read_identity(self): return "LabJack", "U3-HV", "470012345"
+        def set_dac(self, channel, volts): pass
+        def read_dac_volts(self): return 0.0001, 0.2
+        def read_io_config(self): return 0, 0, 0, 0, False, False
+        def close(self): pass
+
+    monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3-HV",
+        "expected_serial": "470012345",
+        "safety": {"dac_safe_max_volts": 0.01},
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)[0]
+
+    assert result.state == "unsafe"
     assert not result.safe
-    assert any("DAC readback" in error for error in result.errors)
+
+
+def test_labjack_identity_change_before_second_dac_write_blocks_remaining_writes(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3-HV",
+        serial="470012345", idn="LabJack,U3-HV,470012345", vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+    events = []
+
+    class Driver:
+        identities = iter((
+            ("LabJack", "U3-HV", "470012345"),
+            ("LabJack", "U3-HV", "REPLACED"),
+        ))
+
+        def __init__(self, *, serial): pass
+        def read_identity(self):
+            events.append(("identity",))
+            return next(self.identities)
+        def set_dac(self, channel, volts): events.append(("write", channel, volts))
+        def read_dac_volts(self): raise AssertionError("must not verify after authorization failure")
+        def read_io_config(self): raise AssertionError("must not verify after authorization failure")
+        def close(self): pass
+
+    monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3-HV",
+        "expected_serial": "470012345",
+        "safety": {"dac_safe_max_volts": 0.01},
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)[0]
+
+    assert events == [("identity",), ("write", 0, 0.0), ("identity",)]
+    assert result.actions == ("DAC0=0.0 V",)
+    assert result.state == "unverifiable"
+    assert any("pre-write authorization failed" in error for error in result.errors)
+
+
+def test_labjack_active_digital_output_is_unsafe(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3-HV",
+        serial="470012345", idn="LabJack,U3-HV,470012345", vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+
+    class Driver:
+        def __init__(self, *, serial): pass
+        def read_identity(self): return "LabJack", "U3-HV", "470012345"
+        def set_dac(self, channel, volts): pass
+        def read_dac_volts(self): return 0.0, 0.0
+        def read_io_config(self): return 1, 0, 0, 0, False, False
+        def close(self): pass
+
+    monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3-HV",
+        "expected_serial": "470012345",
+        "safety": {"dac_safe_max_volts": 0.01},
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)[0]
+
+    assert result.state == "unsafe"
+    assert not result.safe
+
+
+def test_labjack_structured_identity_control_character_never_authorizes_write(monkeypatch):
+    identity = InstrumentIdentity(
+        transport="usb", resource="USB::u3", manufacturer="LabJack", model="U3-HV",
+        serial="470012345", idn="LabJack,U3-HV,470012345", vendor_id="0cd5", product_id="0003",
+    )
+    monkeypatch.setattr(safety, "discover_usb", lambda: [identity])
+    writes = []
+
+    class Driver:
+        def __init__(self, *, serial): pass
+        def read_identity(self): return "LabJack", "U3-HV", "470012345\n"
+        def set_dac(self, channel, volts): writes.append((channel, volts))
+        def close(self): pass
+
+    monkeypatch.setattr(safety, "LabJackU3Driver", Driver)
+    config = {"rig": {"instruments": [{
+        "name": "daq", "connection": identity.resource,
+        "expected_manufacturer": "LabJack", "expected_model": "U3-HV",
+        "expected_serial": "470012345",
+        "safety": {"dac_safe_max_volts": 0.01},
+    }]}}
+
+    result = safety.apply_usb_safe_state(config=config)[0]
+
+    assert writes == []
+    assert result.state == "unverifiable"
 
 
 def test_no_config_labjack_discovery_is_strictly_read_only(monkeypatch):

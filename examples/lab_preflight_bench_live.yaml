@@ -1,0 +1,39 @@
+rig:
+  name: long-game-lab
+  dut_type: instrument-validation-bench
+  instruments:
+    - name: oscilloscope
+      connection: "USB0::6833::1416::DS1ET153818956\0::0::INSTR"
+      expected_manufacturer: Rigol Technologies
+      expected_model: DS1102E
+      expected_serial: DS1ET153818956
+      safety:
+        # Reviewed classification: the scope is used only for read-only smoke probes
+        # and does not source DUT energy.
+        validated_non_energy: true
+
+    - name: electronic_load
+      connection: USB0::6833::3601::DL3A222000386::0::INSTR
+      expected_manufacturer: RIGOL TECHNOLOGIES
+      expected_model: DL3021
+      expected_serial: DL3A222000386
+      safety:
+        energy_source: true
+
+    - name: power_supply
+      connection: USB0::6833::3601::DP8C172602885::0::INSTR
+      expected_manufacturer: RIGOL TECHNOLOGIES
+      expected_model: DP832
+      expected_serial: DP8C172602885
+      safety:
+        energy_source: true
+
+    - name: daq
+      connection: USB::0cd5::0003::serial320104933
+      expected_manufacturer: LabJack
+      expected_model: U3-HV
+      expected_serial: "320104933"
+      safety:
+        energy_source: true
+        # The U3's calibrated zero command reads back slightly above 0 V.
+        dac_safe_max_volts: 0.01

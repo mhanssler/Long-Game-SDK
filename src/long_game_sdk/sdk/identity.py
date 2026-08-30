@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 IdentityFields = tuple[str, str, str]
 _IDENTITY_FIELD_NAMES = ("manufacturer", "model", "serial")
 
 
 def normalize_identity_value(value: str) -> str:
-    """Reject C0/DEL controls before trimming ordinary surrounding spaces."""
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    """Reject controls/non-ASCII whitespace, then trim ordinary ASCII spaces."""
+    if any(
+        unicodedata.category(character).startswith("C")
+        or (character.isspace() and character != " ")
+        for character in value
+    ):
         raise ValueError("control characters are not allowed in identity values")
-    return value.strip()
+    return value.strip(" ")
 
 
 def parse_identity(value: str) -> IdentityFields | None:
@@ -23,6 +29,21 @@ def parse_identity(value: str) -> IdentityFields | None:
     if len(parts) < 3 or any(not part for part in parts[:3]):
         return None
     return parts[0], parts[1], parts[2]
+
+
+def parse_identity_response(value: str) -> IdentityFields | None:
+    """Remove one SCPI line terminator, then apply strict identity validation.
+
+    VISA backends may return the protocol framing terminator as part of ``query``.
+    Only one terminal LF or CRLF is framing; embedded, repeated, bare-CR, NUL,
+    and all other control characters remain invalid.
+    """
+
+    if value.endswith("\r\n"):
+        value = value[:-2]
+    elif value.endswith("\n"):
+        value = value[:-1]
+    return parse_identity(value)
 
 
 def identity_field_equal(field: str, left: str, right: str) -> bool:

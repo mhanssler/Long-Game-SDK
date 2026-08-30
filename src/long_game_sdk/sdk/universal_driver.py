@@ -16,7 +16,12 @@ from typing import Any
 import pyvisa
 import yaml
 
-from long_game_sdk.sdk.identity import identities_equal, normalize_identity_value, parse_identity
+from long_game_sdk.sdk.identity import (
+    identities_equal,
+    normalize_identity_value,
+    parse_identity,
+    parse_identity_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +292,7 @@ class UniversalDriver:
         try:
             response = str(instrument.query("*IDN?"))
             self.identity_response = response
-            fields = self._parse_idn(response)
+            fields = self._parse_live_idn(response)
             self.identity_fields = fields
             normalized_response = ",".join(fields) if fields is not None else response
             schema_matches = re.search(pattern, normalized_response, re.IGNORECASE) is not None
@@ -303,7 +308,12 @@ class UniversalDriver:
 
     @staticmethod
     def _parse_idn(response: str) -> tuple[str, str, str] | None:
+        """Parse configured/canonical identity without transport framing."""
         return parse_identity(response)
+
+    @staticmethod
+    def _parse_live_idn(response: str) -> tuple[str, str, str] | None:
+        return parse_identity_response(response)
 
     @classmethod
     def _expected_identity_fields(

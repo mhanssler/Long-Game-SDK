@@ -210,6 +210,11 @@ def test_armed_write_rechecks_identity_instead_of_using_cached_verification(tmp_
         "\tACME,SAFE-1,SN1,1.0",
         "ACME,SAFE\x00-1,SN1,1.0",
         "ACME,SAFE-1,SN\x001,1.0",
+        "ACME,SAFE-1,SN1,1.0\n\n",
+        "ACME,SAFE-1,SN1,1.0\r\n\r\n",
+        "ACME,SAFE-1,SN1\n,1.0",
+        "ACME,SAFE-1,SN1\u0085,1.0",
+        "ACME,SAFE-1,SN1\u2028,1.0",
     ],
 )
 def test_live_identity_controls_and_serial_case_mismatch_never_authorize_write(
@@ -246,7 +251,7 @@ def test_configured_identity_controls_are_rejected_without_writes(
 
 
 def test_write_identity_allows_spaces_and_vendor_model_case_with_exact_serial(tmp_path: Path) -> None:
-    instrument = FakeInstrument(idn="  acme  ,  safe-1  ,  SN1  ,1.0")
+    instrument = FakeInstrument(idn="  acme  ,  safe-1  ,  SN1  ,1.0\r\n")
     path = write_schema(tmp_path, schema_with({"set_voltage": bounded_write()}))
     driver = UniversalDriver(
         "mock", path, instrument=instrument, trusted_schema=True,

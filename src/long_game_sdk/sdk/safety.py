@@ -18,6 +18,7 @@ from long_game_sdk.sdk.identity import (
     identity_field_equal,
     normalize_identity_value,
     parse_identity,
+    parse_identity_response,
 )
 
 SafeState = Literal["verified_safe", "unsafe", "unverifiable", "no_action_required"]
@@ -69,11 +70,17 @@ _DEFAULT_SAFE_CURRENT = 0.01
 
 
 def _parse_idn(idn: str) -> tuple[str, str, str] | None:
+    """Parse configured/canonical identity without transport normalization."""
     return parse_identity(idn)
 
 
+def _parse_live_idn(idn: str) -> tuple[str, str, str] | None:
+    """Parse a live SCPI response after removing exactly one line terminator."""
+    return parse_identity_response(idn)
+
+
 def _model_from_idn(idn: str) -> str:
-    parsed = _parse_idn(idn)
+    parsed = _parse_live_idn(idn)
     if parsed is None:
         return "UNKNOWN"
     received_model = parsed[1].casefold()
@@ -276,11 +283,17 @@ def _is_labjack_u3_binding(binding: Mapping[str, Any]) -> bool:
     return model == "u3" or model.startswith("u3-")
 
 
-def _identity_error(idn: str, expected: Mapping[str, Any]) -> str | None:
-    parsed = _parse_idn(idn)
-    if parsed is None:
-        return f"malformed instrument identity: {idn}"
-    manufacturer, model, serial = parsed
+def _identity_fields_error(
+    received: tuple[str, str, str], expected: Mapping[str, Any]
+) -> str | None:
+    try:
+        manufacturer, model, serial = (
+            normalize_identity_value(field) for field in received
+        )
+    except (TypeError, ValueError):
+        return f"malformed instrument identity fields: {received!r}"
+    if not manufacturer or not model or not serial:
+        return f"malformed instrument identity fields: {received!r}"
     wanted = _expected_identity_fields(expected)
     if wanted is None:
         wanted_manufacturer = normalize_identity_value(
@@ -306,6 +319,13 @@ def _identity_error(idn: str, expected: Mapping[str, Any]) -> str | None:
     if wanted_serial and not identity_field_equal("serial", wanted_serial, serial):
         return f"identity mismatch: expected serial {wanted_serial}; received {serial}"
     return None
+
+
+def _identity_error(idn: str, expected: Mapping[str, Any]) -> str | None:
+    parsed = _parse_live_idn(idn)
+    if parsed is None:
+        return f"malformed instrument identity: {idn}"
+    return _identity_fields_error(parsed, expected)
 
 
 def _authorize_visa_write(instrument: Any, expected: Mapping[str, Any]) -> str | None:
@@ -522,19 +542,74 @@ def apply_usb_safe_state(
                 resource, identity.idn, "U3", (), (), (mismatch,), "unverifiable"
             ))
             continue
+        threshold = binding.get("dac_safe_max_volts")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float, str)):
+            results.append(SafeStateResult(
+                resource, identity.idn, identity.model, (), (),
+                ("LabJack U3 requires numeric dac_safe_max_volts",), "unverifiable",
+            ))
+            continue
+        try:
+            maximum_dac_volts = float(threshold)
+        except ValueError:
+            maximum_dac_volts = math.nan
+        if not math.isfinite(maximum_dac_volts) or not 0 < maximum_dac_volts <= 0.1:
+            results.append(SafeStateResult(
+                resource, identity.idn, identity.model, (), (),
+                ("LabJack U3 dac_safe_max_volts must be greater than 0 and at most 0.1",),
+                "unverifiable",
+            ))
+            continue
 
         actions: list[str] = []
         checks: list[tuple[str, str]] = []
         errors: list[str] = []
+        state: SafeState = "unverifiable"
         driver = None
         try:
             if not identity.serial or identity.serial.upper() == "UNKNOWN":
                 raise RuntimeError("LabJack serial is unavailable; refusing to open an unbound device")
             driver = LabJackU3Driver(serial=identity.serial)
-            driver.safe_state()
-            actions.extend(("DAC0=0.0 V", "DAC1=0.0 V"))
-            errors.append(
-                "DAC writes acknowledged, but the LabJack adapter API provides no DAC readback"
+            for channel in (0, 1):
+                live_identity = driver.read_identity()
+                fresh_mismatch = _identity_fields_error(live_identity, binding)
+                if fresh_mismatch:
+                    raise RuntimeError(
+                        f"pre-write authorization failed for DAC{channel}: {fresh_mismatch}"
+                    )
+                driver.set_dac(channel, 0.0)
+                actions.append(f"DAC{channel}=0.0 V")
+
+            dac0, dac1 = driver.read_dac_volts()
+            (
+                fio_direction,
+                eio_direction,
+                cio_direction,
+                timers_enabled,
+                counter0_enabled,
+                counter1_enabled,
+            ) = driver.read_io_config()
+            checks.extend((
+                ("DAC0 voltage", f"{dac0:g} V"),
+                ("DAC1 voltage", f"{dac1:g} V"),
+                ("FIO direction mask", str(fio_direction)),
+                ("EIO direction mask", str(eio_direction)),
+                ("CIO direction mask", str(cio_direction)),
+                ("timers enabled", str(timers_enabled)),
+                ("counter 0 enabled", str(counter0_enabled)),
+                ("counter 1 enabled", str(counter1_enabled)),
+            ))
+            state = (
+                "verified_safe"
+                if abs(dac0) <= maximum_dac_volts
+                and abs(dac1) <= maximum_dac_volts
+                and fio_direction == 0
+                and eio_direction == 0
+                and cio_direction == 0
+                and timers_enabled == 0
+                and not counter0_enabled
+                and not counter1_enabled
+                else "unsafe"
             )
         except LabJackDependencyError as exc:
             errors.append(str(exc))
@@ -546,8 +621,12 @@ def apply_usb_safe_state(
                     driver.close()
                 except Exception:
                     pass
-        state: SafeState = "verified_safe" if not errors else "unverifiable"
-        results.append(SafeStateResult(resource, identity.idn, "U3", tuple(actions), tuple(checks), tuple(errors), state))
+        if errors:
+            state = "unverifiable"
+        results.append(SafeStateResult(
+            resource, identity.idn, identity.model, tuple(actions), tuple(checks),
+            tuple(errors), state,
+        ))
     return results
 
 

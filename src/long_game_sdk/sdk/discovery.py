@@ -8,10 +8,13 @@ Discovery is intentionally broad:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, cast
 
 import pyvisa
+
+from long_game_sdk.sdk.drivers.labjack_u3 import LabJackU3Driver
+from long_game_sdk.sdk.identity import parse_identity
 
 try:  # PyUSB is required for raw USB inventory.
     import usb.core
@@ -89,6 +92,57 @@ def discover_visa() -> list[InstrumentIdentity]:
     return identities
 
 
+def _enrich_single_labjack_u3(
+    identities: list[InstrumentIdentity],
+) -> list[InstrumentIdentity]:
+    """Use LabJack's read-only config query when one U3 can be assigned unambiguously."""
+
+    candidates = [
+        index
+        for index, identity in enumerate(identities)
+        if (identity.vendor_id, identity.product_id) == ("0cd5", "0003")
+    ]
+    if len(candidates) != 1:
+        return identities
+
+    driver = None
+    try:
+        driver = LabJackU3Driver()
+        manufacturer, model, serial = driver.read_identity()
+        idn = f"{manufacturer},{model},{serial}"
+        parsed = parse_identity(idn)
+        if parsed is None:
+            return identities
+        manufacturer, model, serial = parsed
+        if (
+            manufacturer.casefold() != "labjack"
+            or not model.casefold().startswith("u3")
+            or serial.casefold() == "unknown"
+        ):
+            return identities
+        index = candidates[0]
+        original = identities[index]
+        enriched = replace(
+            original,
+            resource=f"USB::{original.vendor_id}::{original.product_id}::serial{serial}",
+            manufacturer=manufacturer,
+            model=model,
+            serial=serial,
+            idn=idn,
+        )
+        result = list(identities)
+        result[index] = enriched
+        return result
+    except Exception:
+        return identities
+    finally:
+        if driver is not None:
+            try:
+                driver.close()
+            except Exception:
+                pass
+
+
 def discover_usb() -> list[InstrumentIdentity]:
     """Discover raw USB devices for non-VISA equipment such as LabJack U3."""
 
@@ -126,7 +180,7 @@ def discover_usb() -> list[InstrumentIdentity]:
                 product_id=product_id,
             )
         )
-    return identities
+    return _enrich_single_labjack_u3(identities)
 
 
 def discover_all() -> list[InstrumentIdentity]:
