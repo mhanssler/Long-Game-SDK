@@ -38,6 +38,8 @@ class SmokeResult:
 class SmokeSafetyError(RuntimeError):
     """Raised when a smoke run cannot prove its initial or final safe state."""
 
+    probe_phase_entered: bool | None = None
+
 
 _READ_ONLY_SCPI_QUERY = re.compile(
     r"^(?:\*[A-Za-z][A-Za-z0-9]*|:[A-Za-z][A-Za-z0-9]*(?::[A-Za-z][A-Za-z0-9]*)*)\?"
@@ -175,10 +177,16 @@ def run_smoke(config: Mapping[str, Any] | None = None) -> list[SmokeResult]:
     """
 
     results: list[SmokeResult] = []
+    probe_phase_entered = False
     try:
         # This gate prevents discovery/probes unless every result is positively
         # safe or explicitly validated as non-energizing.
-        _verify_safe_state(config, "initial")
+        try:
+            _verify_safe_state(config, "initial")
+        except SmokeSafetyError as exc:
+            exc.probe_phase_entered = False
+            raise
+        probe_phase_entered = True
         for identity in discover_all():
             schema_path = ensure_schema(identity)
             if identity.transport == "visa":
@@ -188,17 +196,50 @@ def run_smoke(config: Mapping[str, Any] | None = None) -> list[SmokeResult]:
     finally:
         # Outermost cleanup covers gate, discovery, and probe failures. The
         # helper attempts both transports before it can fail.
-        _verify_safe_state(config, "final")
+        try:
+            _verify_safe_state(config, "final")
+        except SmokeSafetyError as exc:
+            exc.probe_phase_entered = probe_phase_entered
+            raise
     return results
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run read-only hardware probes between verified safe states"
+        prog="lg-smoke",
+        description=(
+            "Safely verify communication with the exact instruments declared in a bench YAML file."
+        ),
+        epilog="""What BENCH_CONFIG is:
+  An input YAML file containing rig.instruments with each expected instrument's
+  exact connection and identity. Use the same bench YAML accepted by lg-preflight;
+  it is not a report file or an instrument address by itself.
+
+What the command does:
+  1. Requires an initial verified safe state for the complete declared bench.
+  2. Runs identity and other allow-listed read-only probes.
+  3. Requires a final verified safe state, even after a probe failure.
+
+Example (PowerShell):
+  lg-discover
+  lg-preflight .\\bench.yaml
+  lg-smoke .\\bench.yaml
+
+Result meaning:
+  PASS     All read-only probes passed, and both safety gates passed.
+  FAIL     Safety gates passed, but one or more read-only probes failed.
+  BLOCKED  Initial or final safety verification failed; the run is not a PASS.
+           An initial gate failure prevents probes. A final gate failure can
+           occur after probes have run.
+
+Exit status: 0 = PASS, 1 = probe failure, 2 = invalid config or safety BLOCKED.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "config",
-        help="Bench/preflight YAML with rig.instruments exact expected-equipment inventory",
+        metavar="BENCH_CONFIG",
+        help="path to bench/preflight YAML containing the exact rig.instruments inventory",
     )
     try:
         args = parser.parse_args(list(argv) if argv is not None else None)
@@ -214,10 +255,24 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 2
 
     print("--- Long Game SDK Hardware Smoke ---")
+    print(f"Bench config: {Path(args.config)}")
+    print("Sequence: initial safety gate -> read-only probes -> final safety gate")
     try:
         results = run_smoke(config)
     except SmokeSafetyError as exc:
-        print(f"smoke safety error: {exc}")
+        print(
+            "BLOCKED: Exact instrument identity and safe output state "
+            "could not be positively verified at one or more safety gates."
+        )
+        if exc.probe_phase_entered is False:
+            print("Read-only smoke probes were not allowed: the initial safety gate failed.")
+        elif exc.probe_phase_entered is True:
+            print("Read-only probe phase was entered; final safety verification failed.")
+        else:
+            print("Probe execution status is unavailable; do not assume that no probes ran.")
+        print("This is an unverified condition, not proof that the bench is dangerous.")
+        print("Safe-state commands may have been attempted; confirm the physical bench state before continuing.")
+        print(f"Details: {exc}")
         return 2
     for result in results:
         print(f"\n{result.resource}")
@@ -233,7 +288,23 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("  errors:")
             for error in result.errors:
                 print(f"    {error}")
-    return 1 if any(result.errors for result in results) else 0
+
+    passed_checks = sum(len(result.checks) for result in results)
+    failed_checks = sum(len(result.errors) for result in results)
+    instrument_count = len(results)
+    instrument_label = "instrument" if instrument_count == 1 else "instruments"
+    if failed_checks:
+        print(
+            f"\nFAIL: {instrument_count} {instrument_label} probed; "
+            "initial and final safe-state verification passed, but read-only probe errors occurred."
+        )
+    else:
+        print(
+            f"\nPASS: {instrument_count} {instrument_label} probed; "
+            "initial and final safe-state verification passed."
+        )
+    print(f"Read-only checks: {passed_checks} passed, {failed_checks} failed")
+    return 1 if failed_checks else 0
 
 
 if __name__ == "__main__":

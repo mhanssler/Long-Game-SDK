@@ -97,6 +97,111 @@ def test_smoke_cli_requires_and_loads_expected_equipment_config(monkeypatch, tmp
     assert seen == [config]
 
 
+def test_smoke_help_explains_config_workflow_and_result_meaning(capsys):
+    assert smoke.main(["-h"]) == 0
+
+    output = capsys.readouterr().out
+    assert "BENCH_CONFIG" in output
+    assert "lg-smoke .\\bench.yaml" in output
+    assert "rig.instruments" in output
+    assert "initial verified safe state" in output
+    assert "read-only probes" in output
+    assert "final verified safe state" in output
+    assert "Exit status" in output
+
+
+def test_smoke_cli_prints_clear_pass_summary(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "bench.yaml"
+    path.write_text("rig:\n  instruments: []\n")
+    monkeypatch.setattr(
+        smoke,
+        "run_smoke",
+        lambda config: [
+            smoke.SmokeResult(
+                resource="USB::SCOPE",
+                model="DS1102E",
+                instrument_class="oscilloscope",
+                driver_kind="schema",
+                schema="schemas/rigol_ds1102e.yaml",
+                checks=(("*IDN?", "RIGOL,DS1102E,SN1,1"),),
+                errors=(),
+            )
+        ],
+    )
+
+    assert smoke.main([str(path)]) == 0
+
+    output = capsys.readouterr().out
+    assert f"Bench config: {path}" in output
+    assert "PASS: 1 instrument probed" in output
+    assert "initial and final safe-state verification passed" in output
+    assert "Read-only checks: 1 passed, 0 failed" in output
+
+
+def test_smoke_cli_explains_safety_block_before_details(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "bench.yaml"
+    path.write_text("rig:\n  instruments: []\n")
+    monkeypatch.setattr(
+        smoke,
+        "run_smoke",
+        lambda config: (_ for _ in ()).throw(smoke.SmokeSafetyError("identity did not match")),
+    )
+
+    assert smoke.main([str(path)]) == 2
+
+    output = capsys.readouterr().out
+    assert "BLOCKED: Exact instrument identity and safe output state" in output
+    assert "Probe execution status is unavailable" in output
+    assert "not proof that the bench is dangerous" in output
+    assert output.index("BLOCKED:") < output.index("identity did not match")
+
+
+@pytest.mark.parametrize("initial_safe,final_safe", [(False, False), (False, True), (True, False)])
+def test_smoke_cli_reports_actual_probe_phase_on_safety_gate_failure(
+    monkeypatch, tmp_path, capsys, initial_safe, final_safe
+):
+    path = tmp_path / "bench.yaml"
+    path.write_text("rig:\n  instruments: []\n")
+    states = iter([[_safe() if initial_safe else _blocked()], [_safe() if final_safe else _blocked()]])
+    events = []
+    monkeypatch.setattr(smoke, "apply_safe_state", lambda **_: next(states))
+    monkeypatch.setattr(smoke, "apply_usb_safe_state", lambda **_: [])
+    identity = InstrumentIdentity(transport="visa", resource="USB::SCOPE", model="DS1102E")
+    monkeypatch.setattr(smoke, "discover_all", lambda: [identity])
+    monkeypatch.setattr(smoke, "ensure_schema", lambda _: None)
+    monkeypatch.setattr(
+        smoke, "_smoke_visa",
+        lambda *_: events.append("probe") or smoke.SmokeResult(
+            "USB::SCOPE", "DS1102E", "oscilloscope", "fake", "", (("*IDN?", "ID"),), ()
+        ),
+    )
+
+    assert smoke.main([str(path)]) == 2
+    output = capsys.readouterr().out
+    assert "PASS:" not in output
+    assert "Safe-state commands may have been attempted" in output
+    if initial_safe:
+        assert events == ["probe"]
+        assert "Read-only probe phase was entered" in output
+        assert "probes were not allowed" not in output
+    else:
+        assert events == []
+        assert "Read-only smoke probes were not allowed" in output
+
+
+def test_smoke_cli_prints_probe_failure_summary(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "bench.yaml"
+    path.write_text("rig:\n  instruments: []\n")
+    monkeypatch.setattr(smoke, "run_smoke", lambda _: [smoke.SmokeResult(
+        "USB::SCOPE", "DS1102E", "oscilloscope", "fake", "", (), ("*IDN?: timeout",)
+    )])
+    assert smoke.main([str(path)]) == 1
+    output = capsys.readouterr().out
+    assert "FAIL: 1 instrument probed" in output
+    assert "initial and final safe-state verification passed" in output
+    assert "Read-only checks: 0 passed, 1 failed" in output
+
+
 def test_smoke_cli_returns_nonzero_on_safety_failure(monkeypatch, tmp_path):
     path = tmp_path / "bench.yaml"
     path.write_text("rig:\n  instruments: []\n")
