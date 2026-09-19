@@ -7,9 +7,12 @@ import pytest
 from long_game_sdk.sdk.streams import AsyncTransport, ExpectEOF, ExpectSession, SubprocessTransport, SyncExpectSession
 
 
-def test_sync_subprocess_session_round_trip_and_cleanup() -> None:
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_sync_subprocess_session_round_trip_and_cleanup(newline: str) -> None:
+    # Exercise both text-output newline conventions on every host without normalizing bytes.
     program = (
-        "import sys; print('ready>', flush=True); "
+        f"import sys; sys.stdout.reconfigure(newline={newline!r}); "
+        "print('ready>', flush=True); "
         "line=sys.stdin.readline(); print('echo:'+line, end='', flush=True)"
     )
     with SyncExpectSession.subprocess(sys.executable, "-u", "-c", program) as session:
@@ -17,7 +20,8 @@ def test_sync_subprocess_session_round_trip_and_cleanup() -> None:
         assert isinstance(transport, SubprocessTransport)
         session.expect("ready>", timeout=1)
         session.send_text("hello", newline=True)
-        assert session.expect(b"echo:hello\n", timeout=1).match == b"echo:hello\n"
+        expected = b"echo:hello" + newline.encode("ascii")
+        assert session.expect(expected, timeout=1).match == expected
 
     assert transport.process.returncode is not None
     assert session.closed
